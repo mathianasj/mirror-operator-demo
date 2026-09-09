@@ -1,0 +1,221 @@
+---
+- name: Configure RHEL 9 host with KVM, GNOME, and VNC
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    # --- Set ec2-user password for Cockpit login ---
+
+    - name: Set password for ec2-user
+      ansible.builtin.shell: echo 'ec2-user:{{ vnc_password }}' | chpasswd
+      changed_when: true
+      no_log: true
+
+    # --- Virtualization stack ---
+
+    - name: Install virtualization packages
+      ansible.builtin.dnf:
+        name:
+          - qemu-kvm
+          - libvirt
+          - libvirt-client
+          - virt-install
+          - virt-viewer
+          - guestfs-tools
+        state: present
+
+    - name: Install cockpit packages
+      ansible.builtin.dnf:
+        name:
+          - cockpit
+          - cockpit-machines
+          - cockpit-storaged
+        state: present
+
+    - name: Enable and start libvirtd
+      ansible.builtin.systemd:
+        name: libvirtd
+        enabled: true
+        state: started
+
+    - name: Enable and start cockpit
+      ansible.builtin.systemd:
+        name: cockpit.socket
+        enabled: true
+        state: started
+
+    # --- GNOME desktop + Firefox ---
+
+    - name: Install GNOME desktop environment
+      ansible.builtin.dnf:
+        name: "@workstation-product-environment"
+        state: present
+
+    - name: Install Firefox
+      ansible.builtin.dnf:
+        name: firefox
+        state: present
+
+    - name: Set default target to graphical
+      ansible.builtin.systemd:
+        name: graphical.target
+        enabled: true
+      notify: set graphical target
+
+    # --- TigerVNC ---
+
+    - name: Install TigerVNC server
+      ansible.builtin.dnf:
+        name: tigervnc-server
+        state: present
+
+    - name: Create VNC directory for ec2-user
+      ansible.builtin.file:
+        path: /home/ec2-user/.vnc
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+        mode: "0755"
+
+    - name: Configure VNC server
+      ansible.builtin.copy:
+        dest: /home/ec2-user/.vnc/config
+        owner: ec2-user
+        group: ec2-user
+        mode: "0644"
+        content: |
+          session=gnome
+          geometry={{ vnc_geometry }}
+          localhost=no
+          alwaysshared
+
+    - name: Set VNC password
+      ansible.builtin.shell: |
+        echo "{{ vnc_password }}" | vncpasswd -f > /home/ec2-user/.vnc/passwd
+      args:
+        creates: /home/ec2-user/.vnc/passwd
+      become_user: ec2-user
+      no_log: true
+
+    - name: Set VNC password file permissions
+      ansible.builtin.file:
+        path: /home/ec2-user/.vnc/passwd
+        owner: ec2-user
+        group: ec2-user
+        mode: "0600"
+
+    - name: Create VNC user mapping
+      ansible.builtin.copy:
+        dest: /etc/tigervnc/vncserver.users
+        content: |
+          :{{ vnc_display }}=ec2-user
+        mode: "0644"
+
+    - name: Enable and start VNC server
+      ansible.builtin.systemd:
+        name: "vncserver@:{{ vnc_display }}"
+        enabled: true
+        state: started
+
+    # --- Firewall ---
+
+    - name: Install firewalld
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
+
+    - name: Enable and start firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Open firewall ports
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - 9090/tcp   # Cockpit
+        - 5901/tcp   # VNC
+
+    # --- NTP server for isolated network ---
+
+    - name: Install chrony
+      ansible.builtin.dnf:
+        name: chrony
+        state: present
+
+    - name: Deploy chrony config
+      ansible.builtin.template:
+        src: ../templates/chrony.conf.j2
+        dest: /etc/chrony.conf
+        mode: "0644"
+      notify: Restart chronyd
+
+    - name: Enable and start chronyd
+      ansible.builtin.systemd:
+        name: chronyd
+        enabled: true
+        state: started
+
+    - name: Open NTP firewall port on libvirt zone
+      ansible.posix.firewalld:
+        port: 123/udp
+        zone: libvirt
+        permanent: true
+        immediate: true
+        state: enabled
+
+    # --- Host DNS (wildcard resolution for isolated network) ---
+
+    - name: Configure NetworkManager to use dnsmasq
+      ansible.builtin.copy:
+        dest: /etc/NetworkManager/conf.d/dns-dnsmasq.conf
+        mode: "0644"
+        content: |
+          [main]
+          dns=dnsmasq
+      notify: Restart NetworkManager
+
+    - name: Create dnsmasq config directory
+      ansible.builtin.file:
+        path: /etc/NetworkManager/dnsmasq.d
+        state: directory
+        mode: "0755"
+
+    - name: Add DNS entries for isolated network
+      ansible.builtin.template:
+        src: ../templates/host-dnsmasq.conf.j2
+        dest: /etc/NetworkManager/dnsmasq.d/isolated-network.conf
+        mode: "0644"
+      notify: Restart NetworkManager
+
+    # --- Validate ---
+
+    - name: Validate KVM support
+      ansible.builtin.command: virt-host-validate qemu
+      register: virt_validate
+      changed_when: false
+
+    - name: Display validation result
+      ansible.builtin.debug:
+        var: virt_validate.stdout_lines
+
+  handlers:
+    - name: set graphical target
+      ansible.builtin.command: systemctl set-default graphical.target
+      changed_when: true
+
+    - name: Restart chronyd
+      ansible.builtin.systemd:
+        name: chronyd
+        state: restarted
+
+    - name: Restart NetworkManager
+      ansible.builtin.systemd:
+        name: NetworkManager
+        state: restarted

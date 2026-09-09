@@ -1,0 +1,17 @@
+apiVersion: noobaa.io/v1alpha1
+kind: BackingStore
+metadata:
+  name: {{ noobaa_backing_store_name }}
+  namespace: {{ odf_namespace }}
+  finalizers:
+    - noobaa.io/finalizer
+spec:
+  type: pv-pool
+  pvPool:
+    numVolumes: {{ noobaa_pv_pool_num_volumes }}
+    storageClass: {{ gp3_high_perf_sc_name }}
+    resources:
+      requests:
+        storage: {{ noobaa_pv_pool_volume_size }}
+      limits:
+        memory: 4Gi

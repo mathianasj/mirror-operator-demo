@@ -1,0 +1,167 @@
+---
+- name: Set up Redfish simulation with sushy-emulator
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Install python3-pip
+      ansible.builtin.dnf:
+        name: python3-pip
+        state: present
+
+    - name: Install sushy-tools
+      ansible.builtin.pip:
+        name: sushy-tools
+        state: present
+
+    - name: Create sushy config directory
+      ansible.builtin.file:
+        path: /etc/sushy
+        state: directory
+        mode: "0755"
+
+    - name: Create sushy TLS directory
+      ansible.builtin.file:
+        path: /etc/sushy/tls
+        state: directory
+        mode: "0755"
+
+    - name: Check if TLS certificate already exists
+      ansible.builtin.stat:
+        path: "{{ sushy_emulator_ssl_cert }}"
+      register: sushy_cert
+
+    - name: Generate self-signed TLS certificate
+      ansible.builtin.command: >
+        openssl req -x509 -newkey rsa:2048
+        -keyout {{ sushy_emulator_ssl_key }}
+        -out {{ sushy_emulator_ssl_cert }}
+        -days 365 -nodes
+        -subj "/CN=sushy-emulator"
+      when: not sushy_cert.stat.exists
+      notify: Restart sushy-emulator
+
+    - name: Deploy sushy-emulator config
+      ansible.builtin.template:
+        src: ../templates/sushy-emulator.conf.j2
+        dest: /etc/sushy/sushy-emulator.conf
+        mode: "0644"
+      notify: Restart sushy-emulator
+
+    - name: Create systemd service for sushy-emulator
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/sushy-emulator.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Sushy Redfish Emulator
+          After=libvirtd.service
+          Requires=libvirtd.service
+
+          [Service]
+          ExecStart=/usr/local/bin/sushy-emulator --config /etc/sushy/sushy-emulator.conf
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart sushy-emulator
+
+    - name: Open firewall port for sushy-emulator on libvirt zone
+      ansible.posix.firewalld:
+        port: "{{ sushy_emulator_port }}/tcp"
+        zone: libvirt
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Enable and restart sushy-emulator
+      ansible.builtin.systemd:
+        name: sushy-emulator
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Flush handlers to restart sushy-emulator before health check
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for sushy-emulator to be ready
+      ansible.builtin.command: >
+        curl -sk -o /dev/null -w '%{http_code}'
+        https://{{ sushy_emulator_listen_ip }}:{{ sushy_emulator_port }}/redfish/v1
+      register: redfish_check
+      retries: 5
+      delay: 3
+      until: redfish_check.stdout == "200"
+      changed_when: false
+
+    - name: List available Redfish systems
+      ansible.builtin.command: >
+        curl -sk https://{{ sushy_emulator_listen_ip }}:{{ sushy_emulator_port }}/redfish/v1/Systems
+      register: redfish_systems
+      changed_when: false
+
+    - name: List all libvirt VM names
+      ansible.builtin.command: virsh list --all --name
+      register: libvirt_vms_raw
+      changed_when: false
+
+    - name: Set non-empty libvirt VM names
+      ansible.builtin.set_fact:
+        libvirt_vm_names: "{{ libvirt_vms_raw.stdout_lines | map('trim') | reject('equalto', '') | list }}"
+
+    - name: Get UUID for each libvirt VM
+      ansible.builtin.command: virsh domuuid {{ item }}
+      loop: "{{ libvirt_vm_names }}"
+      register: vm_uuid_results
+      changed_when: false
+
+    - name: Build VM to Redfish endpoint list
+      ansible.builtin.set_fact:
+        redfish_vm_endpoints: >-
+          {{
+            redfish_vm_endpoints | default([]) + [{
+              'vm_name': item.item,
+              'uuid': item.stdout | trim,
+              'redfish_url': 'https://' ~ sushy_emulator_listen_ip ~ ':' ~ (sushy_emulator_port | string) ~ '/redfish/v1/Systems/' ~ (item.stdout | trim)
+            }]
+          }}
+      loop: "{{ vm_uuid_results.results }}"
+      when: item.stdout is defined
+
+    - name: Parse Redfish systems response
+      ansible.builtin.set_fact:
+        redfish_member_uuids: >-
+          {{
+            (redfish_systems.stdout | from_json).Members
+            | default([])
+            | json_query('[]."@odata.id"')
+            | default([])
+            | map('regex_replace', '.*/Systems/', '')
+            | list
+          }}
+
+    - name: Display Redfish endpoint summary
+      ansible.builtin.debug:
+        msg:
+          - "Redfish endpoint: https://{{ sushy_emulator_listen_ip }}:{{ sushy_emulator_port }}/redfish/v1"
+          - "Libvirt VMs: {{ redfish_vm_endpoints | default([]) | length }} | Listed in Redfish API: {{ redfish_member_uuids | length }}"
+
+    - name: Display Redfish system details
+      ansible.builtin.debug:
+        msg:
+          - "{{ item.vm_name }}"
+          - "  UUID: {{ item.uuid }}"
+          - "  URL:  {{ item.redfish_url }}{{ ' (not listed by Redfish API)' if item.uuid not in redfish_member_uuids else '' }}"
+      loop: "{{ redfish_vm_endpoints | default([]) | sort(attribute='vm_name') }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+  handlers:
+    - name: Restart sushy-emulator
+      ansible.builtin.systemd:
+        name: sushy-emulator
+        state: restarted
+        daemon_reload: true

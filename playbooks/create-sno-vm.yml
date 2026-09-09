@@ -1,0 +1,62 @@
+---
+- name: Create SNO VM with no OS
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Check if VM already exists
+      ansible.builtin.command: virsh dominfo {{ sno_vm_name }}
+      register: vm_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create SNO VM with virt-install
+      ansible.builtin.command: >
+        virt-install
+        --name {{ sno_vm_name }}
+        --vcpus {{ sno_vm_vcpus }}
+        --memory {{ sno_vm_memory_mb }}
+        --disk size={{ sno_vm_disk_size_gb }},pool={{ storage_pool_name }},format=qcow2,bus=virtio
+        --network network={{ isolated_network_name }},model=virtio
+        --boot uefi,hd,cdrom
+        --os-variant generic
+        --graphics vnc,listen=0.0.0.0
+        --noautoconsole
+        --import
+      when: vm_exists.rc != 0
+
+    - name: Force off SNO VM (no OS to handle ACPI shutdown)
+      community.libvirt.virt:
+        name: "{{ sno_vm_name }}"
+        state: destroyed
+      failed_when: false
+
+    - name: Wait for VM to be shut off
+      ansible.builtin.command: virsh domstate {{ sno_vm_name }}
+      register: vm_state
+      until: vm_state.stdout == "shut off"
+      retries: 10
+      delay: 3
+      changed_when: false
+
+    - name: Verify VM was created
+      ansible.builtin.command: virsh dominfo {{ sno_vm_name }}
+      register: vm_info
+      changed_when: false
+
+    - name: Display VM info
+      ansible.builtin.debug:
+        var: vm_info.stdout_lines
+
+    - name: Get VM UUID for Redfish
+      ansible.builtin.command: virsh domuuid {{ sno_vm_name }}
+      register: sno_vm_uuid
+      changed_when: false
+
+    - name: Display Redfish endpoint info
+      ansible.builtin.debug:
+        msg: |
+          SNO VM UUID: {{ sno_vm_uuid.stdout }}
+          Redfish System: https://{{ sushy_emulator_listen_ip }}:{{ sushy_emulator_port }}/redfish/v1/Systems/{{ sno_vm_uuid.stdout }}

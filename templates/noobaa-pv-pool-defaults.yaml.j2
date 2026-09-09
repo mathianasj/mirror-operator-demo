@@ -1,0 +1,10 @@
+apiVersion: noobaa.io/v1alpha1
+kind: NooBaa
+metadata:
+  name: {{ noobaa_cr_name }}
+  namespace: {{ odf_namespace }}
+spec:
+  manualDefaultBackingStore: true
+  pvPoolDefaultStorageClass: {{ gp3_high_perf_sc_name }}
+  cleanupPolicy:
+    allowNoobaaDeletion: true

@@ -1,0 +1,116 @@
+---
+- name: Connect to AWS OpenShift cluster
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}. Set KUBECONFIG or ensure ~/.kube/config exists."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster API reachability
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: cluster_nodes
+
+    - name: Fail when no nodes are reachable
+      ansible.builtin.fail:
+        msg: "Could not list cluster nodes. Check kubeconfig and cluster connectivity."
+      when: cluster_nodes.resources | length == 0
+
+    - name: Get OpenShift version
+      ansible.builtin.command:
+        cmd: oc version -o json
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: oc_version_cmd
+      changed_when: false
+
+    - name: Parse OpenShift version facts
+      ansible.builtin.set_fact:
+        ocp_version: "{{ (oc_version_cmd.stdout | from_json).openshiftVersion }}"
+        odf_operator_channel: "stable-{{ (oc_version_cmd.stdout | from_json).openshiftVersion | regex_search('^\\d+\\.\\d+') }}"
+
+    - name: Get cluster version status
+      ansible.builtin.command:
+        cmd: oc get clusterversion version -o json
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: cluster_version_cmd
+      changed_when: false
+
+    - name: Parse cluster version availability
+      ansible.builtin.set_fact:
+        cluster_version_available: >-
+          {{
+            (
+              cluster_version_cmd.stdout | from_json
+            ).status.conditions
+            | selectattr('type', 'equalto', 'Available')
+            | map(attribute='status')
+            | first
+            | default('Unknown')
+          }}
+
+    - name: Fail when cluster version is not Available
+      ansible.builtin.fail:
+        msg: "ClusterVersion is not Available (status={{ cluster_version_available }})."
+      when: cluster_version_available | string | lower != 'true'
+
+    - name: Get storage classes
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: storage_classes
+
+    - name: Record default storage class name
+      ansible.builtin.set_fact:
+        ocp_default_sc_name: >-
+          {{
+            storage_classes.resources
+            | json_query(query)
+            | first
+            | default('unknown', true)
+          }}
+      vars:
+        query: >-
+          [?metadata.annotations."storageclass.kubernetes.io/is-default-class"=='true'].metadata.name
+
+    - name: Find EBS CSI storage class
+      ansible.builtin.set_fact:
+        ebs_csi_storage_classes: >-
+          {{
+            storage_classes.resources
+            | selectattr('provisioner', 'equalto', 'ebs.csi.aws.com')
+            | map(attribute='metadata.name')
+            | list
+          }}
+
+    - name: Fail when EBS CSI provisioner is missing
+      ansible.builtin.fail:
+        msg: "No StorageClass with provisioner ebs.csi.aws.com found. This playbook requires AWS EBS CSI."
+      when: ebs_csi_storage_classes | length == 0
+
+    - name: Display cluster connection summary
+      ansible.builtin.debug:
+        msg:
+          - "Kubeconfig: {{ ocp_kubeconfig }}"
+          - "OpenShift version: {{ ocp_version }}"
+          - "ODF operator channel: {{ odf_operator_channel }}"
+          - "Default StorageClass: {{ ocp_default_sc_name }}"
+          - "EBS CSI StorageClasses: {{ ebs_csi_storage_classes | join(', ') }}"
+          - "Nodes: {{ cluster_nodes.resources | length }}"

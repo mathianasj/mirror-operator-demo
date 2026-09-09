@@ -1,0 +1,7 @@
+{% for record in isolated_network_dns_records | default([]) %}
+{% if record.wildcard | default(false) %}
+address=/{{ record.hostname }}/{{ record.ip }}
+{% else %}
+address=/{{ record.hostname }}/{{ record.ip }}
+{% endif %}
+{% endfor %}

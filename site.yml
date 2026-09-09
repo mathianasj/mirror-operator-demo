@@ -1,0 +1,24 @@
+---
+- name: Provision EC2 bare metal instance
+  ansible.builtin.import_playbook: playbooks/provision-ec2.yml
+
+- name: Configure host with KVM, GNOME, and VNC
+  ansible.builtin.import_playbook: playbooks/configure-host.yml
+
+- name: Create libvirt networks
+  ansible.builtin.import_playbook: playbooks/create-networks.yml
+
+- name: Create storage pool
+  ansible.builtin.import_playbook: playbooks/create-storage.yml
+
+- name: Create RHEL 9 workstation VM
+  ansible.builtin.import_playbook: playbooks/create-fedora-vm.yml
+
+- name: Create bare VM
+  ansible.builtin.import_playbook: playbooks/create-bare-vm.yml
+
+- name: Create SNO VM
+  ansible.builtin.import_playbook: playbooks/create-sno-vm.yml
+
+- name: Set up Redfish simulation
+  ansible.builtin.import_playbook: playbooks/setup-redfish.yml

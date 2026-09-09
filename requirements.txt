@@ -1,0 +1,6 @@
+ansible
+boto3
+botocore
+kubernetes
+openshift
+pyyaml

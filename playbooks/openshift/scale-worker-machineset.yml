@@ -1,0 +1,153 @@
+---
+- name: Scale worker MachineSet replicas
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}. Run connect-cluster.yml first or set KUBECONFIG."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Get MachineSets
+      kubernetes.core.k8s_info:
+        api_version: machine.openshift.io/v1beta1
+        kind: MachineSet
+        namespace: "{{ ocp_machineset_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: machinesets_info
+
+    - name: Filter worker MachineSets
+      ansible.builtin.set_fact:
+        worker_machinesets: >-
+          {{
+            machinesets_info.resources
+            | json_query(worker_machineset_query)
+          }}
+      vars:
+        worker_machineset_query: >-
+          [?spec.template.metadata.labels."machine.openshift.io/cluster-api-machine-role"=='worker']
+
+    - name: Fail when no worker MachineSets are found
+      ansible.builtin.fail:
+        msg: "No worker MachineSets found in {{ ocp_machineset_namespace }}."
+      when: worker_machinesets | length == 0
+
+    - name: Resolve target worker MachineSet name
+      ansible.builtin.set_fact:
+        target_worker_machineset_name: >-
+          {{
+            ocp_worker_machineset_name
+            if ocp_worker_machineset_name | length > 0
+            else (
+              worker_machinesets[0].metadata.name
+              if worker_machinesets | length == 1
+              else ''
+            )
+          }}
+
+    - name: Fail when multiple worker MachineSets exist without explicit name
+      ansible.builtin.fail:
+        msg: >-
+          Found {{ worker_machinesets | length }} worker MachineSets.
+          Set ocp_worker_machineset_name to the MachineSet to scale.
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+
+    - name: Fail when target worker MachineSet could not be resolved
+      ansible.builtin.fail:
+        msg: "Could not resolve a worker MachineSet to scale."
+      when: target_worker_machineset_name | length == 0
+
+    - name: Get current worker MachineSet state
+      kubernetes.core.k8s_info:
+        api_version: machine.openshift.io/v1beta1
+        kind: MachineSet
+        name: "{{ target_worker_machineset_name }}"
+        namespace: "{{ ocp_machineset_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: target_machineset_info
+
+    - name: Record current replica count
+      ansible.builtin.set_fact:
+        current_worker_machineset_replicas: "{{ target_machineset_info.resources[0].spec.replicas | default(0) | int }}"
+
+    - name: Scale worker MachineSet replicas
+      ansible.builtin.command:
+        argv:
+          - oc
+          - patch
+          - machineset
+          - "{{ target_worker_machineset_name }}"
+          - -n
+          - "{{ ocp_machineset_namespace }}"
+          - --type=merge
+          - -p
+          - "{{ machineset_scale_patch | to_json }}"
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      vars:
+        machineset_scale_patch: "{{ {'spec': {'replicas': ocp_worker_machineset_replicas | int}} }}"
+      when: current_worker_machineset_replicas != (ocp_worker_machineset_replicas | int)
+      register: machineset_scale_result
+      changed_when: machineset_scale_result.rc == 0
+
+    - name: Wait for worker MachineSet replicas to become available
+      kubernetes.core.k8s_info:
+        api_version: machine.openshift.io/v1beta1
+        kind: MachineSet
+        name: "{{ target_worker_machineset_name }}"
+        namespace: "{{ ocp_machineset_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: scaled_machineset_info
+      until: >
+        (
+          scaled_machineset_info.resources[0].status.readyReplicas | default(0) | int
+        ) >= (ocp_worker_machineset_replicas | int) and (
+          scaled_machineset_info.resources[0].status.availableReplicas | default(0) | int
+        ) >= (ocp_worker_machineset_replicas | int)
+      retries: 60
+      delay: 30
+      when: ocp_worker_machineset_replicas | int > 0
+
+    - name: Wait for worker machines to reach Running phase
+      kubernetes.core.k8s_info:
+        api_version: machine.openshift.io/v1beta1
+        kind: Machine
+        namespace: "{{ ocp_machineset_namespace }}"
+        label_selectors:
+          - "machine.openshift.io/cluster-api-machineset={{ target_worker_machineset_name }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: worker_machines_info
+      until: >
+        (
+          worker_machines_info.resources
+          | selectattr('status.phase', 'equalto', 'Running')
+          | list
+          | length
+        ) >= (ocp_worker_machineset_replicas | int)
+      retries: 60
+      delay: 30
+      when: ocp_worker_machineset_replicas | int > 0
+
+    - name: Display MachineSet scaling summary
+      ansible.builtin.debug:
+        msg:
+          - "MachineSet: {{ target_worker_machineset_name }}"
+          - "Replicas: {{ current_worker_machineset_replicas }} -> {{ ocp_worker_machineset_replicas }}"
+          - "Ready replicas: {{ scaled_machineset_info.resources[0].status.readyReplicas | default(current_worker_machineset_replicas) if scaled_machineset_info is defined else current_worker_machineset_replicas }}"
+          - "Available replicas: {{ scaled_machineset_info.resources[0].status.availableReplicas | default(current_worker_machineset_replicas) if scaled_machineset_info is defined else current_worker_machineset_replicas }}"
+          - "Running machines: {{ worker_machines_info.resources | selectattr('status.phase', 'equalto', 'Running') | list | length if worker_machines_info is defined else 'n/a' }}"

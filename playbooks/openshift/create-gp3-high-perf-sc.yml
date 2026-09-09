@@ -1,0 +1,46 @@
+---
+- name: Create high-performance gp3 StorageClass
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}. Run connect-cluster.yml first or set KUBECONFIG."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Apply gp3-high-perf StorageClass
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition: "{{ lookup('template', '../../templates/gp3-high-perf-storageclass.yaml.j2') | from_yaml }}"
+      register: gp3_sc_result
+
+    - name: Verify StorageClass exists
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: "{{ gp3_high_perf_sc_name }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: gp3_sc_info
+
+    - name: Assert gp3-high-perf StorageClass parameters
+      ansible.builtin.assert:
+        that:
+          - gp3_sc_info.resources | length == 1
+          - gp3_sc_info.resources[0].provisioner == 'ebs.csi.aws.com'
+          - gp3_sc_info.resources[0].parameters.type == 'gp3'
+          - gp3_sc_info.resources[0].parameters.iops == gp3_high_perf_iops
+          - gp3_sc_info.resources[0].parameters.throughput == gp3_high_perf_throughput
+        fail_msg: "StorageClass {{ gp3_high_perf_sc_name }} was not created with expected parameters."
+        success_msg: "StorageClass {{ gp3_high_perf_sc_name }} is ready ({{ gp3_high_perf_iops }} IOPS, {{ gp3_high_perf_throughput }} MB/s)."

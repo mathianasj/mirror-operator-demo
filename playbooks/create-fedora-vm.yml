@@ -1,0 +1,131 @@
+---
+- name: Create RHEL 9 workstation VM with FIPS and DISA STIG
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Check if RHEL ISO already exists
+      ansible.builtin.stat:
+        path: "{{ iso_storage_path }}/{{ rhel_iso_filename }}"
+      register: rhel_iso
+
+    - name: Download RHEL 9 DVD ISO
+      ansible.builtin.command:
+        cmd: curl -L -o {{ iso_storage_path }}/{{ rhel_iso_filename }} {{ rhel_iso_url }}
+      when: not rhel_iso.stat.exists
+
+    - name: Verify ISO is valid (check minimum size)
+      ansible.builtin.stat:
+        path: "{{ iso_storage_path }}/{{ rhel_iso_filename }}"
+      register: iso_stat
+
+    - name: Re-download ISO if corrupted (too small for DVD)
+      ansible.builtin.shell: |
+        rm -f {{ iso_storage_path }}/{{ rhel_iso_filename }}
+        curl -L -o {{ iso_storage_path }}/{{ rhel_iso_filename }} {{ rhel_iso_url }}
+      when: iso_stat.stat.size < 5000000000
+
+    - name: Template kickstart file
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/rhel-kickstart.cfg.j2"
+        dest: /tmp/rhel-kickstart.cfg
+        mode: "0644"
+
+    - name: Check if VM already exists
+      ansible.builtin.command: virsh dominfo {{ rhel_vm_name }}
+      register: vm_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create RHEL 9 VM with virt-install
+      ansible.builtin.command: >
+        virt-install
+        --name {{ rhel_vm_name }}
+        --vcpus {{ rhel_vm_vcpus }}
+        --memory {{ rhel_vm_memory_mb }}
+        --disk size={{ rhel_vm_disk_size_gb }},pool={{ storage_pool_name }},format=qcow2,bus=virtio
+        --network network=default,model=virtio
+        --location {{ iso_storage_path }}/{{ rhel_iso_filename }},kernel=images/pxeboot/vmlinuz,initrd=images/pxeboot/initrd.img
+        --initrd-inject /tmp/rhel-kickstart.cfg
+        --extra-args "inst.ks=file:/rhel-kickstart.cfg inst.stage2=cdrom console=ttyS0"
+        --os-variant rhel9-unknown
+        --boot uefi
+        --graphics vnc,listen=0.0.0.0
+        --noautoconsole
+      when: vm_exists.rc != 0
+
+    - name: Wait 2 minutes for installer to start
+      ansible.builtin.pause:
+        seconds: 120
+      when: vm_exists.rc != 0
+
+    - name: Wait for RHEL installation to complete (VM shuts off when done)
+      community.libvirt.virt:
+        name: "{{ rhel_vm_name }}"
+        command: status
+      register: vm_status
+      until: vm_status.status == "shutdown" or vm_status.status == "shutoff"
+      retries: 120
+      delay: 60
+      when: vm_exists.rc != 0
+
+    - name: Verify installation wrote to disk
+      ansible.builtin.shell: virsh domblkinfo {{ rhel_vm_name }} vda | awk '/Allocation/{print $2}'
+      register: disk_info
+      changed_when: false
+      when: vm_exists.rc != 0
+
+    - name: Fail if installation did not complete (disk still empty)
+      ansible.builtin.fail:
+        msg: "RHEL installation failed — disk allocation is only {{ disk_info.stdout | trim }} bytes."
+      when: vm_exists.rc != 0 and (disk_info.stdout | trim | int) < 2000000000
+
+    # --- Switch to isolated network after install ---
+
+    - name: Ensure VM is shut off for network switch
+      community.libvirt.virt:
+        name: "{{ rhel_vm_name }}"
+        state: shutdown
+      failed_when: false
+      when: vm_exists.rc != 0
+
+    - name: Wait for VM to fully shut down
+      ansible.builtin.command: virsh domstate {{ rhel_vm_name }}
+      register: vm_state
+      until: vm_state.stdout | trim == "shut off"
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: vm_exists.rc != 0
+
+    - name: Detach NAT network interface
+      ansible.builtin.command: >
+        virsh detach-interface {{ rhel_vm_name }} network --config
+      when: vm_exists.rc != 0
+
+    - name: Attach isolated network interface
+      ansible.builtin.command: >
+        virsh attach-interface {{ rhel_vm_name }} network {{ isolated_network_name }} --model virtio --config
+      when: vm_exists.rc != 0
+
+    - name: Start VM on isolated network
+      community.libvirt.virt:
+        name: "{{ rhel_vm_name }}"
+        state: running
+      when: vm_exists.rc != 0
+
+    - name: Clean up kickstart file
+      ansible.builtin.file:
+        path: /tmp/rhel-kickstart.cfg
+        state: absent
+
+    - name: Verify VM was created
+      ansible.builtin.command: virsh dominfo {{ rhel_vm_name }}
+      register: vm_info
+      changed_when: false
+
+    - name: Display VM info
+      ansible.builtin.debug:
+        var: vm_info.stdout_lines

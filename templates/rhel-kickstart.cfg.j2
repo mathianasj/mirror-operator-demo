@@ -1,0 +1,123 @@
+# RHEL 9 Kickstart — FIPS enabled, DISA STIG hardened
+
+text
+lang en_US.UTF-8
+keyboard us
+timezone UTC --utc
+
+# Network — DHCP for install (NAT network), IPv6 disabled
+network --bootproto=dhcp --device=eth0 --activate --onboot=yes --noipv6
+
+# Root and user accounts
+rootpw --plaintext {{ rhel_vm_root_password }}
+user --name={{ rhel_vm_user }} --password={{ rhel_vm_password }} --plaintext --groups=wheel
+
+# Disk partitioning — LVM with DISA STIG required mount points
+ignoredisk --only-use=vda
+clearpart --all --initlabel --drives=vda
+zerombr
+
+part /boot/efi --fstype=efi --size=600
+part /boot --fstype=ext4 --size=1024
+part pv.01 --fstype=lvmpv --size=1 --grow
+
+volgroup rhel pv.01
+
+logvol /              --vgname=rhel --fstype=ext4 --size=437500 --name=root
+logvol /home          --vgname=rhel --fstype=ext4 --size=288700 --name=home --fsoptions="nodev,nosuid"
+logvol /var           --vgname=rhel --fstype=ext4 --size=30000  --name=var --fsoptions="nodev,nosuid"
+logvol /var/log       --vgname=rhel --fstype=ext4 --size=10000  --name=var_log --fsoptions="nodev,noexec,nosuid"
+logvol /var/log/audit --vgname=rhel --fstype=ext4 --size=5000   --name=var_log_audit --fsoptions="nodev,noexec,nosuid"
+logvol /var/tmp       --vgname=rhel --fstype=ext4 --size=5000   --name=var_tmp --fsoptions="nodev,noexec,nosuid"
+logvol /tmp           --vgname=rhel --fstype=ext4 --size=5000   --name=tmp --fsoptions="nodev,noexec,nosuid"
+logvol swap           --vgname=rhel --fstype=swap --size=16000  --name=swap
+
+# Bootloader with FIPS and STIG-recommended kernel args (UEFI)
+bootloader --append="fips=1 audit=1 audit_backlog_limit=8192 slub_debug=P page_poison=1 vsyscall=none ipv6.disable=1"
+
+# Install source — DVD ISO
+cdrom
+
+# Firewall and SELinux
+firewall --enabled --ssh --port=8443:tcp
+selinux --enforcing
+
+# Services
+services --enabled=sshd,NetworkManager
+
+# Do not run initial setup
+firstboot --disable
+
+# Power off after install (so the playbook can reconfigure boot and network)
+poweroff
+
+# Package selection
+%packages
+@Server with GUI
+firefox
+scap-security-guide
+openscap-scanner
+openscap
+crypto-policies
+crypto-policies-scripts
+%end
+
+# DISA STIG with GUI security profile (allows graphical desktop)
+%addon com_redhat_oscap
+    content-type = scap-security-guide
+    profile = xccdf_org.ssgproject.content_profile_stig_gui
+%end
+
+# Disable kdump
+%addon com_redhat_kdump --disable
+%end
+
+%post --log=/root/ks-post.log
+# Copy Anaconda and OSCAP logs to installed system for debugging
+cp /tmp/anaconda.log /root/ 2>/dev/null || true
+cp /tmp/packaging.log /root/ 2>/dev/null || true
+cp /tmp/storage.log /root/ 2>/dev/null || true
+cp /tmp/program.log /root/ 2>/dev/null || true
+cp -r /tmp/openscap_data /root/ 2>/dev/null || true
+cp /tmp/oscap_*.* /root/ 2>/dev/null || true
+
+# Enable FIPS crypto policy
+update-crypto-policies --set FIPS
+
+# Add boot=UUID to kernel args so FIPS can verify kernel HMAC
+BOOT_UUID=$(findmnt -no UUID /boot)
+grubby --update-kernel=ALL --args="boot=UUID=${BOOT_UUID}"
+
+# Remove install-time DHCP connection profiles so they don't conflict
+rm -f /etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null || true
+rm -f /etc/sysconfig/network-scripts/ifcfg-e* 2>/dev/null || true
+
+# Configure static IP for the isolated network (NIC gets swapped post-install)
+# interface-name is omitted so it applies to whatever single ethernet NIC is present
+cat > /etc/NetworkManager/system-connections/isolated.nmconnection <<NMEOF
+[connection]
+id=isolated
+type=ethernet
+autoconnect=true
+autoconnect-priority=100
+
+[ipv4]
+method=manual
+addresses={{ rhel_vm_ip }}/{{ isolated_network_prefix }}
+gateway={{ isolated_network_gateway }}
+dns={{ isolated_network_gateway }}
+
+[ipv6]
+method=disabled
+NMEOF
+chmod 600 /etc/NetworkManager/system-connections/isolated.nmconnection
+
+# Disable IPv6 system-wide via sysctl
+cat > /etc/sysctl.d/99-disable-ipv6.conf <<SYSEOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+SYSEOF
+
+# Ensure graphical target
+systemctl set-default graphical.target
+%end

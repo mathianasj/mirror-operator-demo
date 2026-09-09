@@ -1,0 +1,110 @@
+# Fedora Kickstart — FIPS enabled, DISA STIG hardened
+
+text
+lang en_US.UTF-8
+keyboard us
+timezone UTC --utc
+
+# Network — DHCP for install (NAT network)
+network --bootproto=dhcp --device=eth0 --activate --onboot=yes
+
+# Root and user accounts
+rootpw --plaintext {{ fedora_vm_root_password }}
+user --name={{ fedora_vm_user }} --password={{ fedora_vm_password }} --plaintext --groups=wheel
+
+# Disk partitioning — LVM with DISA STIG required mount points
+ignoredisk --only-use=vda
+clearpart --all --initlabel --drives=vda
+zerombr
+
+part /boot/efi --fstype=efi --size=600
+part /boot --fstype=ext4 --size=1024
+part pv.01 --fstype=lvmpv --size=1 --grow
+
+volgroup fedora pv.01
+
+logvol /              --vgname=fedora --fstype=ext4 --size=250000 --name=root
+logvol /home          --vgname=fedora --fstype=ext4 --size=175000 --name=home --fsoptions="nodev,nosuid"
+logvol /var           --vgname=fedora --fstype=ext4 --size=30000  --name=var --fsoptions="nodev,nosuid"
+logvol /var/log       --vgname=fedora --fstype=ext4 --size=10000  --name=var_log --fsoptions="nodev,noexec,nosuid"
+logvol /var/log/audit --vgname=fedora --fstype=ext4 --size=5000   --name=var_log_audit --fsoptions="nodev,noexec,nosuid"
+logvol /var/tmp       --vgname=fedora --fstype=ext4 --size=5000   --name=var_tmp --fsoptions="nodev,noexec,nosuid"
+logvol /tmp           --vgname=fedora --fstype=ext4 --size=5000   --name=tmp --fsoptions="nodev,noexec,nosuid"
+logvol swap           --vgname=fedora --fstype=swap --size=16000  --name=swap
+
+# Bootloader with FIPS kernel arg (UEFI)
+bootloader --append="fips=1"
+
+# Install source — HTTP mirror
+url --url="http://mirror.arizona.edu/fedora/linux/releases/44/Everything/x86_64/os/"
+
+# Firewall and SELinux
+firewall --enabled --ssh
+selinux --enforcing
+
+# Services
+services --enabled=sshd,NetworkManager
+
+# Do not run initial setup
+firstboot --disable
+
+# Power off after install (so the playbook can reconfigure boot and network)
+poweroff
+
+# Package selection
+%packages
+@workstation-product-environment
+scap-security-guide
+openscap-scanner
+openscap
+crypto-policies
+crypto-policies-scripts
+%end
+
+# DISA STIG security profile
+%addon org_fedora_oscap
+    content-type = scap-security-guide
+    profile = xccdf_org.ssgproject.content_profile_stig
+%end
+
+# Disable kdump
+%addon com_redhat_kdump --disable
+%end
+
+%post --log=/root/ks-post.log
+# Copy Anaconda and OSCAP logs to installed system for debugging
+cp /tmp/anaconda.log /root/ 2>/dev/null || true
+cp /tmp/packaging.log /root/ 2>/dev/null || true
+cp /tmp/storage.log /root/ 2>/dev/null || true
+cp /tmp/program.log /root/ 2>/dev/null || true
+cp -r /tmp/openscap_data /root/ 2>/dev/null || true
+cp /tmp/oscap_*.* /root/ 2>/dev/null || true
+
+# Enable FIPS crypto policy
+update-crypto-policies --set FIPS
+
+# Add boot=UUID to kernel args so FIPS can verify kernel HMAC
+BOOT_UUID=$(findmnt -no UUID /boot)
+grubby --update-kernel=ALL --args="boot=UUID=${BOOT_UUID}"
+
+# Configure static IP for the isolated network (NIC gets swapped post-install)
+cat > /etc/NetworkManager/system-connections/isolated.nmconnection <<NMEOF
+[connection]
+id=isolated
+type=ethernet
+autoconnect=true
+
+[ipv4]
+method=manual
+addresses={{ fedora_vm_ip }}/{{ isolated_network_prefix }}
+dns={{ isolated_network_gateway }}
+gateway=
+
+[ipv6]
+method=disabled
+NMEOF
+chmod 600 /etc/NetworkManager/system-connections/isolated.nmconnection
+
+# Ensure graphical target
+systemctl set-default graphical.target
+%end

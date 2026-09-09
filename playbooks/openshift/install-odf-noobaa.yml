@@ -1,0 +1,262 @@
+---
+- name: Install ODF operator and standalone NooBaa MCG
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}. Run connect-cluster.yml first or set KUBECONFIG."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Detect ODF operator channel when not set
+      when: odf_operator_channel is not defined
+      block:
+        - name: Get OpenShift version for ODF channel
+          ansible.builtin.command:
+            cmd: oc version -o json
+          environment:
+            KUBECONFIG: "{{ ocp_kubeconfig }}"
+          register: oc_version_cmd
+          changed_when: false
+
+        - name: Set ODF operator channel from OpenShift version
+          ansible.builtin.set_fact:
+            odf_operator_channel: "stable-{{ (oc_version_cmd.stdout | from_json).openshiftVersion | regex_search('^\\d+\\.\\d+') }}"
+
+    - name: Create openshift-storage namespace
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ odf_namespace }}"
+
+    - name: Apply ODF OperatorGroup
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition: "{{ lookup('template', '../../templates/odf-operatorgroup.yaml.j2') | from_yaml }}"
+
+    - name: Apply ODF Subscription
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition: "{{ lookup('template', '../../templates/odf-subscription.yaml.j2') | from_yaml }}"
+
+    - name: Wait for ODF operator CSV to succeed
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: odf_csv_info
+      until: >
+        (
+          odf_csv_info.resources
+          | selectattr('metadata.name', 'search', '^' ~ odf_operator_package)
+          | selectattr('status.phase', 'equalto', 'Succeeded')
+          | list
+          | length
+        ) > 0
+      retries: 60
+      delay: 30
+
+    - name: Wait for StorageCluster CRD to be established
+      kubernetes.core.k8s_info:
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: storageclusters.ocs.openshift.io
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: storagecluster_crd_info
+      until: >
+        storagecluster_crd_info.resources | length > 0
+        and (
+          storagecluster_crd_info.resources[0].status.conditions
+          | default([])
+          | selectattr('type', 'equalto', 'Established')
+          | selectattr('status', 'equalto', 'True')
+          | list
+          | length
+        ) > 0
+      retries: 30
+      delay: 10
+
+    - name: Apply standalone MCG StorageCluster
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition: "{{ lookup('template', '../../templates/odf-storagecluster-standalone.yaml.j2') | from_yaml }}"
+
+    - name: Wait for ocs-operator child subscription to be created
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: Subscription
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: ocs_sub_info
+      until: >
+        (
+          ocs_sub_info.resources
+          | selectattr('spec.name', 'equalto', odf_ocs_operator_package)
+          | list
+          | length
+        ) > 0
+      retries: 30
+      delay: 10
+
+    - name: Wait for ocs-operator CSV to succeed
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: ocs_csv_info
+      until: >
+        (
+          ocs_csv_info.resources
+          | selectattr('metadata.name', 'search', '^' ~ odf_ocs_operator_package)
+          | selectattr('status.phase', 'equalto', 'Succeeded')
+          | list
+          | length
+        ) > 0
+      retries: 60
+      delay: 30
+
+    - name: Wait for ocs-operator deployment to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: ocs-operator
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: ocs_deploy_info
+      until: >
+        ocs_deploy_info.resources | length > 0
+        and ocs_deploy_info.resources[0].status.availableReplicas | default(0) > 0
+      retries: 30
+      delay: 15
+
+    - name: Wait for StorageCluster to become Available
+      block:
+        - name: Wait for StorageCluster Available condition
+          ansible.builtin.command:
+            cmd: >-
+              oc wait storagecluster/{{ odf_storagecluster_name }}
+              -n {{ odf_namespace }}
+              --for=condition=Available
+              --timeout=20m
+          environment:
+            KUBECONFIG: "{{ ocp_kubeconfig }}"
+          changed_when: false
+      rescue:
+        - name: Collect StorageCluster status on timeout
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - storagecluster
+              - "{{ odf_storagecluster_name }}"
+              - -n
+              - "{{ odf_namespace }}"
+              - -o
+              - yaml
+          environment:
+            KUBECONFIG: "{{ ocp_kubeconfig }}"
+          register: storagecluster_status_dump
+          changed_when: false
+          failed_when: false
+
+        - name: Collect ocs-operator health on timeout
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - csv,subscription,deploy/ocs-operator
+              - -n
+              - "{{ odf_namespace }}"
+          environment:
+            KUBECONFIG: "{{ ocp_kubeconfig }}"
+          register: ocs_operator_health_dump
+          changed_when: false
+          failed_when: false
+
+        - name: Fail with StorageCluster diagnostics
+          ansible.builtin.fail:
+            msg: >-
+              StorageCluster {{ odf_storagecluster_name }} did not become Available within 20m.
+              Ensure {{ odf_ocs_operator_package }} CSV exists and is Succeeded
+              (do not delete the ocs-operator CSV — it is required even for standalone MCG).
+              StorageCluster status:
+              {{ storagecluster_status_dump.stdout | default('(unavailable)') }}
+              ocs-operator resources:
+              {{ ocs_operator_health_dump.stdout | default('(unavailable)') }}
+
+    - name: Wait for NooBaa CR to be created
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: "{{ noobaa_cr_name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: noobaa_cr_info
+      until: noobaa_cr_info.resources | length > 0
+      retries: 60
+      delay: 15
+
+    - name: Get Ceph RBD StorageClass
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: ocs-storagecluster-ceph-rbd
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: ceph_rbd_sc
+
+    - name: Assert standalone MCG did not create Ceph storage
+      ansible.builtin.assert:
+        that:
+          - ceph_rbd_sc.resources | length == 0
+        fail_msg: "Ceph StorageClass ocs-storagecluster-ceph-rbd exists — standalone MCG should not deploy Ceph."
+        success_msg: "Standalone MCG confirmed — no Ceph StorageClass present."
+
+    - name: Get NooBaa pods
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odf_namespace }}"
+        label_selectors:
+          - noobaa-operator
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: noobaa_pods
+
+    - name: Display ODF installation summary
+      ansible.builtin.debug:
+        msg:
+          - "ODF operator package: {{ odf_operator_package }}"
+          - "ODF operator channel: {{ odf_operator_channel }}"
+          - "StorageCluster: {{ odf_storagecluster_name }} (Available)"
+          - "NooBaa CR: {{ noobaa_cr_name }}"
+          - "Configure pv-pool backing store: playbooks/openshift/configure-noobaa-backing-store.yml"
+          - "NooBaa operator pods: {{ noobaa_pods.resources | length }}"

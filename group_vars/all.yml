@@ -1,0 +1,110 @@
+---
+# EC2 Instance
+ec2_instance_type: m5.metal
+ec2_root_volume_size: 1500  # GB
+ec2_root_volume_type: gp3
+ec2_root_volume_iops: 6000
+ec2_root_volume_throughput: 400  # MB/s
+ec2_instance_name: mirror-operator-hypervisor
+ec2_instance_count: 1
+ec2_key_name: mirror-operator-key
+ec2_key_local_path: "{{ playbook_dir }}/../keys"
+ec2_security_group_name: mirror-operator-sg
+ec2_vpc_domain_pattern: "*.opentlc.com"
+
+# VNC
+vnc_password: "changeme"  # Override with ansible-vault or -e
+vnc_display: 1
+vnc_geometry: "1920x1080"
+
+# Isolated Network
+isolated_network_name: isolated
+isolated_network_bridge: virbr-isolated
+isolated_network_subnet: 192.168.100.0
+isolated_network_prefix: 24
+isolated_network_gateway: 192.168.100.1
+isolated_network_dhcp_start: 192.168.100.100
+isolated_network_dhcp_end: 192.168.100.200
+isolated_network_dns_records:
+  - hostname: mirror.example.com
+    ip: 192.168.100.10
+  - hostname: api.c0.example.com
+    ip: 192.168.100.11
+  - hostname: apps.c0.example.com
+    ip: 192.168.100.11
+    wildcard: true
+  - hostname: api.sno.example.com
+    ip: 192.168.100.12
+  - hostname: apps.sno.example.com
+    ip: 192.168.100.12
+    wildcard: true
+
+# Storage Pool
+storage_pool_name: default
+storage_pool_path: /var/lib/libvirt/images
+iso_storage_path: /var/lib/libvirt/images/iso
+
+# RHEL 9 VM
+rhel_vm_name: rhel-workstation
+rhel_vm_vcpus: 8
+rhel_vm_memory_mb: 32768  # 32 GB
+rhel_vm_disk_size_gb: 800
+rhel_iso_url: ""  # Override with -e rhel_iso_url="https://access.cdn.redhat.com/..."
+rhel_iso_filename: "rhel-9-dvd.iso"  # Override with -e if needed
+rhel_vm_ip: 192.168.100.10
+rhel_vm_user: admin
+rhel_vm_password: "changeme"  # Override with ansible-vault or -e
+rhel_vm_root_password: "changeme"  # Override with ansible-vault or -e
+
+# Bare VM
+bare_vm_name: bare-vm
+bare_vm_vcpus: 18
+bare_vm_memory_mb: 51200  # 50 GB
+bare_vm_disk_size_gb: 120
+bare_vm_extra_disk_size_gb: 300
+
+# SNO VM
+sno_vm_name: sno-vm
+sno_vm_vcpus: 10
+sno_vm_memory_mb: 24576  # 24 GB
+sno_vm_disk_size_gb: 120
+
+# NTP
+ntp_allowed_network: 192.168.100.0/24
+
+# Redfish / sushy-emulator
+sushy_emulator_listen_ip: 192.168.100.1
+sushy_emulator_port: 8000
+sushy_emulator_libvirt_uri: "qemu:///system"
+sushy_emulator_ssl_cert: /etc/sushy/tls/cert.pem
+sushy_emulator_ssl_key: /etc/sushy/tls/key.pem
+
+# OpenShift / ODF
+ocp_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(lookup('env', 'HOME') ~ '/.kube/config', true) }}"
+ocp_verify_ssl: false  # sandbox/lab clusters often use self-signed chains; set true for production
+
+ocp_machineset_namespace: openshift-machine-api
+ocp_worker_machineset_name: ""  # auto-detect when empty and exactly one worker MachineSet exists
+ocp_worker_machineset_replicas: 2
+ocp_machineset_scale_timeout: 30m
+
+gp3_high_perf_sc_name: gp3-high-perf
+gp3_high_perf_iops: "16000"
+gp3_high_perf_throughput: "1000"
+
+odf_namespace: openshift-storage
+odf_storagecluster_name: ocs-storagecluster
+odf_resource_profile: lean
+odf_operator_package: odf-operator
+odf_operator_subscription_name: odf-operator
+odf_ocs_operator_package: ocs-operator
+odf_operator_starting_csv: ""  # optional pin, e.g. odf-operator.v4.20.17-rhodf
+# odf_operator_channel set at runtime from detected OCP version
+
+noobaa_default_backing_store_name: noobaa-default-backing-store
+noobaa_backing_store_name: noobaa-high-perf-pool
+noobaa_cr_name: noobaa
+noobaa_default_bucket_class_name: noobaa-default-bucket-class
+noobaa_pv_pool_num_volumes: 3
+noobaa_pv_pool_volume_size: 200Gi
+noobaa_min_total_capacity_gi: 500

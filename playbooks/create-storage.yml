@@ -1,0 +1,60 @@
+---
+- name: Create libvirt storage pool
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Check if storage pool already exists
+      ansible.builtin.command: virsh pool-info {{ storage_pool_name }}
+      register: pool_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create storage pool directory
+      ansible.builtin.file:
+        path: "{{ storage_pool_path }}"
+        state: directory
+        mode: "0755"
+      when: pool_check.rc != 0
+
+    - name: Define storage pool
+      community.libvirt.virt_pool:
+        name: "{{ storage_pool_name }}"
+        command: define
+        xml: "{{ lookup('template', playbook_dir + '/../templates/storage-pool.xml.j2') }}"
+      when: pool_check.rc != 0
+
+    - name: Build storage pool
+      community.libvirt.virt_pool:
+        name: "{{ storage_pool_name }}"
+        command: build
+      when: pool_check.rc != 0
+
+    - name: Ensure storage pool is active
+      community.libvirt.virt_pool:
+        name: "{{ storage_pool_name }}"
+        state: active
+
+    - name: Set storage pool to autostart
+      community.libvirt.virt_pool:
+        name: "{{ storage_pool_name }}"
+        autostart: true
+
+    - name: Create ISO storage directory
+      ansible.builtin.file:
+        path: "{{ iso_storage_path }}"
+        state: directory
+        owner: qemu
+        group: qemu
+        mode: "0755"
+
+    - name: Verify storage pool
+      ansible.builtin.command: virsh pool-list --all
+      register: pool_list
+      changed_when: false
+
+    - name: Display storage pools
+      ansible.builtin.debug:
+        var: pool_list.stdout_lines

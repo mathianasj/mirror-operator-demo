@@ -1,0 +1,75 @@
+---
+- name: Create bare VM with no OS
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Check if VM already exists
+      ansible.builtin.command: virsh dominfo {{ bare_vm_name }}
+      register: vm_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create bare VM with virt-install
+      ansible.builtin.command: >
+        virt-install
+        --name {{ bare_vm_name }}
+        --vcpus {{ bare_vm_vcpus }}
+        --memory {{ bare_vm_memory_mb }}
+        --disk size={{ bare_vm_disk_size_gb }},pool={{ storage_pool_name }},format=qcow2,bus=virtio
+        --network network={{ isolated_network_name }},model=virtio
+        --boot uefi,hd,cdrom
+        --os-variant generic
+        --graphics vnc,listen=0.0.0.0
+        --noautoconsole
+        --import
+      when: vm_exists.rc != 0
+
+    - name: Force off bare VM (no OS to handle ACPI shutdown)
+      community.libvirt.virt:
+        name: "{{ bare_vm_name }}"
+        state: destroyed
+      failed_when: false
+
+    - name: Wait for VM to be shut off
+      ansible.builtin.command: virsh domstate {{ bare_vm_name }}
+      register: vm_state
+      until: vm_state.stdout == "shut off"
+      retries: 10
+      delay: 3
+      changed_when: false
+
+    - name: Check if vda disk already has a serial
+      ansible.builtin.shell: >
+        virsh dumpxml {{ bare_vm_name }} | grep -A 5 "dev='vda'" | grep '<serial>'
+      register: vda_serial_check
+      failed_when: false
+      changed_when: false
+
+    - name: Add serial to vda disk
+      ansible.builtin.shell: |
+        virt-xml {{ bare_vm_name }} --edit target=vda --disk serial={{ bare_vm_name }}-vda
+      when: vda_serial_check.rc != 0
+
+    - name: Check if vdb disk already exists
+      ansible.builtin.shell: >
+        virsh dumpxml {{ bare_vm_name }} | grep "dev='vdb'"
+      register: vdb_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Add vdb disk for additional storage
+      ansible.builtin.shell: |
+        virt-xml {{ bare_vm_name }} --add-device --disk size={{ bare_vm_extra_disk_size_gb }},pool={{ storage_pool_name }},format=qcow2,bus=virtio,serial={{ bare_vm_name }}-vdb
+      when: vdb_exists.rc != 0
+
+    - name: Verify VM was created
+      ansible.builtin.command: virsh dominfo {{ bare_vm_name }}
+      register: vm_info
+      changed_when: false
+
+    - name: Display VM info
+      ansible.builtin.debug:
+        var: vm_info.stdout_lines

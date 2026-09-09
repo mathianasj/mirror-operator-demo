@@ -1,0 +1,143 @@
+---
+- name: Configure NooBaa pv-pool BackingStore
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}. Run connect-cluster.yml first or set KUBECONFIG."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Enable manual default backing store control on NooBaa
+      kubernetes.core.k8s:
+        state: present
+        merge_type: merge
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition: "{{ lookup('template', '../../templates/noobaa-pv-pool-defaults.yaml.j2') | from_yaml }}"
+
+    - name: Apply pv-pool BackingStore for bucket placement
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition: "{{ lookup('template', '../../templates/noobaa-backing-store.yaml.j2') | from_yaml }}"
+
+    - name: Wait for pv-pool BackingStore to become Ready
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: BackingStore
+        name: "{{ noobaa_backing_store_name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: backing_store_info
+      until: >
+        backing_store_info.resources | length > 0
+        and (
+          backing_store_info.resources[0].status.phase | default('')
+        ) == 'Ready'
+        or (
+          backing_store_info.resources[0].status
+          | default({'conditions': []}, true)
+          | json_query("conditions[?type=='Available'].status")
+          | first
+          | default('')
+        ) == 'True'
+      retries: 60
+      delay: 30
+
+    - name: Point default BucketClass at pv-pool BackingStore
+      ansible.builtin.command:
+        argv:
+          - oc
+          - patch
+          - bucketclass
+          - "{{ noobaa_default_bucket_class_name }}"
+          - -n
+          - "{{ odf_namespace }}"
+          - --type=merge
+          - -p
+          - "{{ bucketclass_patch | to_json }}"
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      vars:
+        bucketclass_patch:
+          spec:
+            placementPolicy:
+              tiers:
+                - backingStores:
+                    - "{{ noobaa_backing_store_name }}"
+      changed_when: true
+
+    - name: Wait for BucketClass to reference pv-pool BackingStore
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: BucketClass
+        name: "{{ noobaa_default_bucket_class_name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: bucketclass_info
+      until: >
+        (
+          bucketclass_info.resources[0].spec.placementPolicy.tiers[0].backingStores
+          | default([])
+        ) == [noobaa_backing_store_name]
+      retries: 20
+      delay: 15
+
+    - name: Assert pv-pool BackingStore configuration
+      ansible.builtin.assert:
+        that:
+          - backing_store_info.resources[0].spec.type == 'pv-pool'
+          - backing_store_info.resources[0].spec.pvPool.storageClass == gp3_high_perf_sc_name
+        fail_msg: >-
+          {{ noobaa_backing_store_name }} is not a pv-pool on {{ gp3_high_perf_sc_name }}.
+
+    - name: Verify BucketClass placement policy
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              bucketclass_info.resources[0].spec.placementPolicy.tiers[0].backingStores
+              | default([])
+            ) == [noobaa_backing_store_name]
+        fail_msg: >-
+          {{ noobaa_default_bucket_class_name }} does not reference
+          {{ noobaa_backing_store_name }}.
+        success_msg: >-
+          {{ noobaa_default_bucket_class_name }} uses {{ noobaa_backing_store_name }}
+          for new bucket placements.
+
+    - name: Get NamespaceStore resources
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NamespaceStore
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: namespace_stores
+
+    - name: Assert no NamespaceStore resources exist
+      ansible.builtin.assert:
+        that:
+          - namespace_stores.resources | length == 0
+        fail_msg: "NamespaceStore resources found — S3 passthrough must not be configured."
+        success_msg: "No NamespaceStore resources — PVC-backed storage only."
+
+    - name: Display backing store summary
+      ansible.builtin.debug:
+        msg:
+          - "pv-pool BackingStore: {{ noobaa_backing_store_name }} (Ready)"
+          - "Default BucketClass: {{ noobaa_default_bucket_class_name }} → {{ noobaa_backing_store_name }}"
+          - "Operator default store {{ noobaa_default_backing_store_name }} left in place (unused by BucketClass)"

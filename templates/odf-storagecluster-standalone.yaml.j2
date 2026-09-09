@@ -1,0 +1,10 @@
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: {{ odf_storagecluster_name }}
+  namespace: {{ odf_namespace }}
+spec:
+  resourceProfile: {{ odf_resource_profile }}
+  multiCloudGateway:
+    reconcileStrategy: standalone
+    dbStorageClassName: {{ gp3_high_perf_sc_name }}

@@ -1,0 +1,54 @@
+---
+- name: Create libvirt networks
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Ensure default NAT network is active
+      community.libvirt.virt_net:
+        name: default
+        state: active
+
+    - name: Ensure default NAT network autostarts
+      community.libvirt.virt_net:
+        name: default
+        autostart: true
+
+    - name: Destroy isolated network if running
+      community.libvirt.virt_net:
+        name: "{{ isolated_network_name }}"
+        state: inactive
+      failed_when: false
+
+    - name: Undefine isolated network
+      community.libvirt.virt_net:
+        name: "{{ isolated_network_name }}"
+        command: undefine
+      failed_when: false
+
+    - name: Define isolated network
+      community.libvirt.virt_net:
+        name: "{{ isolated_network_name }}"
+        command: define
+        xml: "{{ lookup('template', playbook_dir + '/../templates/isolated-network.xml.j2') }}"
+
+    - name: Start isolated network
+      community.libvirt.virt_net:
+        name: "{{ isolated_network_name }}"
+        state: active
+
+    - name: Set isolated network to autostart
+      community.libvirt.virt_net:
+        name: "{{ isolated_network_name }}"
+        autostart: true
+
+    - name: Verify networks
+      ansible.builtin.command: virsh net-list --all
+      register: net_list
+      changed_when: false
+
+    - name: Display networks
+      ansible.builtin.debug:
+        var: net_list.stdout_lines

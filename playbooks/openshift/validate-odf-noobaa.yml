@@ -1,0 +1,162 @@
+---
+- name: Validate ODF and NooBaa configuration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../group_vars/all.yml
+
+  vars:
+    noobaa_pv_pool_volume_size_gi: "{{ noobaa_pv_pool_volume_size | regex_replace('(?i)Gi$', '') | int }}"
+    noobaa_pv_pool_total_capacity_gi: >-
+      {{ (noobaa_pv_pool_num_volumes | int) * (noobaa_pv_pool_volume_size | regex_replace('(?i)Gi$', '') | int) }}
+
+  tasks:
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}. Run connect-cluster.yml first or set KUBECONFIG."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Get gp3-high-perf StorageClass
+      ansible.builtin.command:
+        cmd: oc get sc {{ gp3_high_perf_sc_name }}
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: gp3_sc_cmd
+      changed_when: false
+      failed_when: gp3_sc_cmd.rc != 0
+
+    - name: Get ODF operator CSV
+      ansible.builtin.command:
+        cmd: oc get csv -n {{ odf_namespace }}
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: csv_cmd
+      changed_when: false
+
+    - name: Assert ODF operator CSV is installed
+      ansible.builtin.assert:
+        that:
+          - "'odf-operator' in csv_cmd.stdout"
+        fail_msg: "odf-operator CSV not found in {{ odf_namespace }}."
+
+    - name: Get StorageCluster
+      ansible.builtin.command:
+        cmd: oc get storagecluster -n {{ odf_namespace }}
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: storagecluster_cmd
+      changed_when: false
+      failed_when: storagecluster_cmd.rc != 0
+
+    - name: Get NooBaa pods
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: openshift_storage_pods
+
+    - name: Filter NooBaa pods
+      ansible.builtin.set_fact:
+        noobaa_running_pods: >-
+          {{
+            openshift_storage_pods.resources
+            | selectattr('metadata.name', 'search', 'noobaa')
+            | selectattr('status.phase', 'equalto', 'Running')
+            | list
+          }}
+
+    - name: Get BackingStore resources
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: BackingStore
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: backing_stores
+
+    - name: Get default pv-pool BackingStore
+      ansible.builtin.set_fact:
+        default_backing_store: >-
+          {{
+            backing_stores.resources
+            | selectattr('metadata.name', 'equalto', noobaa_backing_store_name)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Assert default BackingStore is Ready and pv-pool
+      ansible.builtin.assert:
+        that:
+          - default_backing_store | length > 0
+          - default_backing_store.spec.type == 'pv-pool'
+          - >-
+            (
+              default_backing_store.status.phase | default('')
+            ) == 'Ready'
+            or (
+              default_backing_store.status
+              | default({'conditions': []}, true)
+              | json_query("conditions[?type=='Available'].status")
+              | first
+              | default('')
+            ) == 'True'
+        fail_msg: "BackingStore {{ noobaa_backing_store_name }} is not a Ready pv-pool."
+
+    - name: Assert pv-pool capacity meets minimum
+      ansible.builtin.assert:
+        that:
+          - (noobaa_pv_pool_total_capacity_gi | int) >= (noobaa_min_total_capacity_gi | int)
+        fail_msg: >-
+          Total pv-pool capacity {{ noobaa_pv_pool_total_capacity_gi }}Gi
+          is below minimum {{ noobaa_min_total_capacity_gi }}Gi.
+
+    - name: Get NamespaceStore resources
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NamespaceStore
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: namespace_stores
+
+    - name: Assert no NamespaceStore resources exist
+      ansible.builtin.assert:
+        that:
+          - namespace_stores.resources | length == 0
+        fail_msg: "NamespaceStore resources found — S3 passthrough must not be configured."
+
+    - name: Assert NooBaa pods are Running
+      ansible.builtin.assert:
+        that:
+          - noobaa_running_pods | length > 0
+        fail_msg: "No Running NooBaa pods found in {{ odf_namespace }}."
+
+    - name: Get NooBaa status
+      ansible.builtin.command:
+        cmd: oc -n {{ odf_namespace }} exec deploy/noobaa-operator -- noobaa status
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: noobaa_status_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Display validation summary
+      ansible.builtin.debug:
+        msg:
+          - "StorageClass {{ gp3_high_perf_sc_name }}: OK"
+          - "StorageCluster in {{ odf_namespace }}: OK"
+          - "BackingStore {{ noobaa_backing_store_name }}: Ready (pv-pool)"
+          - "Total pv-pool capacity: {{ noobaa_pv_pool_total_capacity_gi }}Gi"
+          - "Running NooBaa pods: {{ noobaa_running_pods | length }}"
+          - "NamespaceStore count: {{ namespace_stores.resources | length }}"
+          - "NooBaa status output:"
+          - "{{ noobaa_status_cmd.stdout_lines | default(['(noobaa status unavailable)']) }}"

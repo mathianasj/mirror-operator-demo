@@ -1,0 +1,25 @@
+<network xmlns:dnsmasq='http://libvirt.org/schemas/network/dnsmasq/1.0'>
+  <name>{{ isolated_network_name }}</name>
+  <bridge name="{{ isolated_network_bridge }}" stp="on" delay="0"/>
+  <dns>
+{% for record in isolated_network_dns_records | default([]) %}
+{% if not record.wildcard | default(false) %}
+    <host ip="{{ record.ip }}">
+      <hostname>{{ record.hostname }}</hostname>
+    </host>
+{% endif %}
+{% endfor %}
+  </dns>
+  <ip address="{{ isolated_network_gateway }}" netmask="255.255.255.0">
+    <dhcp>
+      <range start="{{ isolated_network_dhcp_start }}" end="{{ isolated_network_dhcp_end }}"/>
+    </dhcp>
+  </ip>
+  <dnsmasq:options>
+{% for record in isolated_network_dns_records | default([]) %}
+{% if record.wildcard | default(false) %}
+    <dnsmasq:option value="address=/{{ record.hostname }}/{{ record.ip }}"/>
+{% endif %}
+{% endfor %}
+  </dnsmasq:options>
+</network>

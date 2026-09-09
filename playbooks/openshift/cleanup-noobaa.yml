@@ -1,0 +1,248 @@
+---
+- name: Clean up NooBaa and standalone MCG resources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Get NooBaa CR
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: "{{ noobaa_cr_name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: noobaa_cr_info
+
+    - name: Reset BucketClass to default backing store name
+      ansible.builtin.command:
+        argv:
+          - oc
+          - patch
+          - bucketclass
+          - "{{ noobaa_default_bucket_class_name }}"
+          - -n
+          - "{{ odf_namespace }}"
+          - --type=merge
+          - -p
+          - "{{ bucketclass_reset_patch | to_json }}"
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      vars:
+        bucketclass_reset_patch:
+          spec:
+            placementPolicy:
+              tiers:
+                - backingStores:
+                    - "{{ noobaa_default_backing_store_name }}"
+                  placement: Spread
+      register: bucketclass_reset
+      failed_when: false
+      changed_when: bucketclass_reset.rc == 0
+      when: noobaa_cr_info.resources | length > 0
+
+    - name: Allow NooBaa deletion via cleanup policy
+      kubernetes.core.k8s:
+        state: present
+        merge_type: merge
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: noobaa.io/v1alpha1
+          kind: NooBaa
+          metadata:
+            name: "{{ noobaa_cr_name }}"
+            namespace: "{{ odf_namespace }}"
+          spec:
+            cleanupPolicy:
+              allowNoobaaDeletion: true
+      when: noobaa_cr_info.resources | length > 0
+
+    - name: Delete StorageCluster
+      kubernetes.core.k8s:
+        state: absent
+        api_version: ocs.openshift.io/v1
+        kind: StorageCluster
+        name: "{{ odf_storagecluster_name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        wait: false
+      register: storagecluster_delete
+
+    - name: Wait for NooBaa CR to be removed
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: "{{ noobaa_cr_name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: noobaa_cr_wait
+      until: noobaa_cr_wait.resources | length == 0
+      retries: 40
+      delay: 15
+      failed_when: false
+
+    - name: Remove NooBaa finalizers when deletion is stuck
+      kubernetes.core.k8s:
+        state: present
+        merge_type: merge
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: noobaa.io/v1alpha1
+          kind: NooBaa
+          metadata:
+            name: "{{ noobaa_cr_name }}"
+            namespace: "{{ odf_namespace }}"
+            finalizers: []
+      when:
+        - noobaa_cr_wait.resources | default([]) | length > 0
+
+    - name: Wait again for NooBaa CR to be removed
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: "{{ noobaa_cr_name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: noobaa_cr_wait_after_finalizer
+      until: noobaa_cr_wait_after_finalizer.resources | length == 0
+      retries: 20
+      delay: 15
+      failed_when: false
+      when:
+        - noobaa_cr_wait.resources | default([]) | length > 0
+
+    - name: Get remaining BackingStores
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: BackingStore
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: remaining_backing_stores
+
+    - name: Remove finalizers from stuck BackingStores
+      kubernetes.core.k8s:
+        state: present
+        merge_type: merge
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: noobaa.io/v1alpha1
+          kind: BackingStore
+          metadata:
+            name: "{{ item.metadata.name }}"
+            namespace: "{{ odf_namespace }}"
+            finalizers: []
+      loop: "{{ remaining_backing_stores.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: remaining_backing_stores.resources | length > 0
+
+    - name: Delete remaining BackingStores
+      kubernetes.core.k8s:
+        state: absent
+        api_version: noobaa.io/v1alpha1
+        kind: BackingStore
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      loop: "{{ remaining_backing_stores.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: remaining_backing_stores.resources | length > 0
+
+    - name: Get remaining BucketClasses
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: BucketClass
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: remaining_bucket_classes
+
+    - name: Delete remaining BucketClasses
+      kubernetes.core.k8s:
+        state: absent
+        api_version: noobaa.io/v1alpha1
+        kind: BucketClass
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      loop: "{{ remaining_bucket_classes.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: remaining_bucket_classes.resources | length > 0
+
+    - name: Get stuck NooBaa PVCs
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ odf_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: openshift_storage_pvcs
+
+    - name: Remove finalizers from stuck PVCs
+      kubernetes.core.k8s:
+        state: present
+        merge_type: merge
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ item.metadata.name }}"
+            namespace: "{{ odf_namespace }}"
+            finalizers: []
+      loop: >-
+        {{
+          openshift_storage_pvcs.resources
+          | selectattr('metadata.deletionTimestamp', 'defined')
+          | list
+        }}
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: openshift_storage_pvcs.resources | length > 0
+
+    - name: Get final cluster state
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - noobaa,storagecluster,backingstore,bucketclass
+          - -n
+          - "{{ odf_namespace }}"
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: cleanup_state
+      changed_when: false
+      failed_when: false
+
+    - name: Display cleanup summary
+      ansible.builtin.debug:
+        msg:
+          - "NooBaa cleanupPolicy.allowNoobaaDeletion: true"
+          - "StorageCluster {{ odf_storagecluster_name }}: delete requested"
+          - "{{ cleanup_state.stdout_lines | default(['(cluster state unavailable)']) }}"
+          - "Re-run install playbooks after cleanup completes."
