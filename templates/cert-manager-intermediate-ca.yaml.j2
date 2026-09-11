@@ -1,0 +1,23 @@
+# Intermediate CA issuer for cert-manager.
+# Apply after cert-manager is installed:
+#   oc apply -f certs/cert-manager-intermediate-ca.yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ cert_manager_intermediate_secret_name }}
+  namespace: {{ cert_manager_namespace }}
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+{{ cert_manager_intermediate_chain_pem | indent(4, first=True) }}
+  tls.key: |
+{{ cert_manager_intermediate_key_pem | indent(4, first=True) }}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ cert_manager_issuer_name }}
+spec:
+  ca:
+    secretName: {{ cert_manager_intermediate_secret_name }}

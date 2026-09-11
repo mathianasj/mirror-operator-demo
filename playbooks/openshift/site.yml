@@ -1,5 +1,7 @@
 ---
 - import_playbook: connect-cluster.yml
+- import_playbook: configure-cluster-proxy.yml
+- import_playbook: configure-cert-manager-issuer.yml
 - import_playbook: scale-worker-machineset.yml
 - import_playbook: create-gp3-high-perf-sc.yml
 - import_playbook: install-odf-noobaa.yml

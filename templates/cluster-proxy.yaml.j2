@@ -1,0 +1,10 @@
+apiVersion: config.openshift.io/v1
+kind: Proxy
+metadata:
+  name: cluster
+spec:
+  httpProxy: {{ ocp_effective_cluster_proxy_url | to_json }}
+  httpsProxy: {{ ocp_effective_cluster_proxy_url | to_json }}
+  noProxy: {{ ocp_effective_cluster_no_proxy | to_json }}
+  trustedCA:
+    name: {{ ocp_cluster_trust_bundle_configmap_name | to_json }}

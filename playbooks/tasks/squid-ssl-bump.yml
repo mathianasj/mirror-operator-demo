@@ -1,0 +1,47 @@
+---
+- name: Set SELinux context for Squid SSL database path
+  ansible.builtin.command: semanage fcontext -a -t squid_cache_t "{{ proxy_ssl_db_path }}(/.*)?"
+  register: semanage_ssl_db
+  failed_when: semanage_ssl_db.rc != 0 and 'already defined' not in (semanage_ssl_db.stderr | default(''))
+  changed_when: semanage_ssl_db.rc == 0
+
+- name: Restore SELinux context on Squid directories
+  ansible.builtin.command: restorecon -Rv /var/spool/squid {{ pki_base_path }}/proxy
+  changed_when: false
+
+- name: Remove Squid SSL certificate database for clean initialization
+  ansible.builtin.file:
+    path: "{{ proxy_ssl_db_path }}"
+    state: absent
+
+- name: Initialize Squid SSL certificate database
+  ansible.builtin.command: >
+    /usr/lib64/squid/security_file_certgen -c -s {{ proxy_ssl_db_path }} -M {{ proxy_ssl_db_size }}
+  become_user: squid
+
+- name: Ensure Squid SSL database ownership
+  ansible.builtin.file:
+    path: "{{ proxy_ssl_db_path }}"
+    state: directory
+    owner: squid
+    group: squid
+    recurse: true
+
+- name: Restore SELinux context on Squid SSL database
+  ansible.builtin.command: restorecon -Rv {{ proxy_ssl_db_path }}
+  changed_when: false
+
+- name: Verify Squid SSL database was initialized
+  ansible.builtin.stat:
+    path: "{{ proxy_ssl_db_path }}/index.txt"
+  register: ssl_db_index
+
+- name: Fail when Squid SSL database is missing
+  ansible.builtin.fail:
+    msg: "SSL database index not found at {{ proxy_ssl_db_path }}/index.txt"
+  when: not ssl_db_index.stat.exists
+
+- name: Remove legacy Squid SSL database path if present
+  ansible.builtin.file:
+    path: /var/lib/squid/ssl_db
+    state: absent

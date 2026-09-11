@@ -27,11 +27,19 @@
         curl -L -o {{ iso_storage_path }}/{{ rhel_iso_filename }} {{ rhel_iso_url }}
       when: iso_stat.stat.size < 5000000000
 
+    - name: Read root CA certificate for kickstart
+      ansible.builtin.slurp:
+        src: "{{ pki_root_ca_cert }}"
+      register: root_ca_slurp
+      when: proxy_enabled | default(false) | bool
+
     - name: Template kickstart file
       ansible.builtin.template:
         src: "{{ playbook_dir }}/../templates/rhel-kickstart.cfg.j2"
         dest: /tmp/rhel-kickstart.cfg
         mode: "0644"
+      vars:
+        root_ca_pem: "{{ root_ca_slurp.content | b64decode if (proxy_enabled | default(false) | bool) else '' }}"
 
     - name: Check if VM already exists
       ansible.builtin.command: virsh dominfo {{ rhel_vm_name }}

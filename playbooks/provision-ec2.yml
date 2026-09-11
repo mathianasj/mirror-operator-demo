@@ -110,7 +110,7 @@
     - name: Create security group
       amazon.aws.ec2_security_group:
         name: "{{ ec2_security_group_name }}"
-        description: "Security group for mirror-operator hypervisor (SSH, VNC, Cockpit)"
+        description: "Security group for mirror-operator hypervisor (SSH, VNC, Cockpit, proxy)"
         vpc_id: "{{ ec2_vpc_id }}"
         rules:
           - proto: tcp
@@ -125,6 +125,10 @@
             ports: 9090
             cidr_ip: 0.0.0.0/0
             rule_desc: Cockpit
+          - proto: tcp
+            ports: "{{ proxy_listen_port }}"
+            cidr_ip: 0.0.0.0/0
+            rule_desc: Corporate MITM proxy
         rules_egress:
           - proto: all
             cidr_ip: 0.0.0.0/0

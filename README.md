@@ -22,16 +22,19 @@ Ansible reads [`ansible.cfg`](ansible.cfg): inventory [`inventory/hosts.yml`](in
 
 ## Playbook flow
 
-[`site.yml`](site.yml) imports eight child playbooks in order:
+[`site.yml`](site.yml) imports eleven child playbooks in order:
 
 1. [`playbooks/provision-ec2.yml`](playbooks/provision-ec2.yml) — launch bare-metal EC2 instance
 2. [`playbooks/configure-host.yml`](playbooks/configure-host.yml) — KVM, GNOME, VNC, Cockpit, NTP, DNS
-3. [`playbooks/create-networks.yml`](playbooks/create-networks.yml) — default NAT + isolated libvirt network
-4. [`playbooks/create-storage.yml`](playbooks/create-storage.yml) — libvirt storage pool and ISO directory
-5. [`playbooks/create-fedora-vm.yml`](playbooks/create-fedora-vm.yml) — RHEL 9 mirror workstation (FIPS + DISA STIG)
-6. [`playbooks/create-bare-vm.yml`](playbooks/create-bare-vm.yml) — bare VM with extra disk
-7. [`playbooks/create-sno-vm.yml`](playbooks/create-sno-vm.yml) — SNO demo VM
-8. [`playbooks/setup-redfish.yml`](playbooks/setup-redfish.yml) — sushy Redfish emulator
+3. [`playbooks/setup-proxy.yml`](playbooks/setup-proxy.yml) — corporate MITM proxy (Squid SSL bump) and PKI
+4. [`playbooks/create-networks.yml`](playbooks/create-networks.yml) — default NAT + isolated libvirt network
+5. [`playbooks/create-storage.yml`](playbooks/create-storage.yml) — libvirt storage pool and ISO directory
+6. [`playbooks/create-fedora-vm.yml`](playbooks/create-fedora-vm.yml) — RHEL 9 mirror workstation (FIPS + DISA STIG)
+7. [`playbooks/create-bare-vm.yml`](playbooks/create-bare-vm.yml) — bare VM with extra disk
+8. [`playbooks/create-sno-vm.yml`](playbooks/create-sno-vm.yml) — SNO demo VM
+9. [`playbooks/setup-redfish.yml`](playbooks/setup-redfish.yml) — sushy Redfish emulator
+10. [`playbooks/openshift/configure-cluster-proxy.yml`](playbooks/openshift/configure-cluster-proxy.yml) — cluster trust bundle + proxy URLs, then [`enable-proxy-mitm.yml`](playbooks/enable-proxy-mitm.yml) (enabled by default)
+11. [`playbooks/openshift/configure-cert-manager-issuer.yml`](playbooks/openshift/configure-cert-manager-issuer.yml) — cert-manager ClusterIssuer (enabled by default)
 
 All configuration flows from [`group_vars/all.yml`](group_vars/all.yml), inventory, CLI extra-vars (`-e`), and external prerequisites. There is no playbook-level `vars:` block in `site.yml`.
 
@@ -82,7 +85,7 @@ All child playbooks load [`group_vars/all.yml`](group_vars/all.yml) via `vars_fi
 | `ec2_instance_count` | `1` | Values >1 append `-1`, `-2`, etc. |
 | `ec2_key_name` | `mirror-operator-key` | EC2 key pair name |
 | `ec2_key_local_path` | `{{ playbook_dir }}/../keys` | Private key saved here |
-| `ec2_security_group_name` | `mirror-operator-sg` | Opens SSH 22, VNC 5901, Cockpit 9090 |
+| `ec2_security_group_name` | `mirror-operator-sg` | Opens SSH 22, VNC 5901, Cockpit 9090, proxy 3128 |
 | `ec2_vpc_domain_pattern` | `*.opentlc.com` | VPC discovery tag filter |
 
 **Runtime-derived (not user inputs):** `ec2_ami`, `ec2_ami_name` (latest RHEL 9 Hourly GP3 AMI), `ec2_vpc_id`, `ec2_subnet_id`, `ec2_instance_names`.
@@ -101,6 +104,7 @@ Default DNS records in `group_vars/all.yml`:
 
 | Hostname | IP |
 |----------|-----|
+| `proxy.example.com` | `192.168.100.1` |
 | `mirror.example.com` | `192.168.100.10` |
 | `api.c0.example.com` | `192.168.100.11` |
 | `apps.c0.example.com` | `192.168.100.11` (wildcard) |
@@ -178,6 +182,96 @@ Kickstart is rendered from [`templates/rhel-kickstart.cfg.j2`](templates/rhel-ki
 
 Config from [`templates/sushy-emulator.conf.j2`](templates/sushy-emulator.conf.j2). A self-signed TLS certificate is generated on first run.
 
+### Corporate proxy and PKI (`setup-proxy.yml`)
+
+Simulates a corporate HTTP/HTTPS proxy with Squid SSL bump (MITM). Generates a two-tier PKI:
+
+| Component | Path / artifact | Purpose |
+|-----------|-----------------|---------|
+| Root CA | `/etc/pki/mirror-operator/root/ca.crt` | Signs dynamic certs for SSL bump; trusted by clients |
+| Intermediate CA | `/etc/pki/mirror-operator/intermediate/ca.crt` + `ca.key` | Issuer for cert-manager |
+| Squid proxy | `http://proxy.example.com:3128` | HTTP/HTTPS forward proxy on isolated gateway (`192.168.100.1`) |
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `proxy_enabled` | `true` | Set `false` to skip proxy/PKI setup |
+| `proxy_listen_port` | `3128` | Squid listen port |
+| `proxy_hostname` | `proxy.example.com` | DNS name (resolved via host dnsmasq) |
+| `proxy_no_proxy` | localhost, isolated subnet, `.example.com` | `NO_PROXY` list |
+| `pki_root_ca_common_name` | `Mirror Operator Root CA` | Root CA subject |
+| `pki_intermediate_ca_common_name` | `Mirror Operator Intermediate CA` | Intermediate CA subject |
+| `cert_manager_issuer_name` | `mirror-operator-intermediate-ca` | ClusterIssuer name |
+
+**Exported artifacts** (gitignored under `certs/`):
+
+- `root-ca.crt` — install on any client that uses the proxy
+- `intermediate-ca.crt`, `intermediate-ca.key`, `intermediate-ca-chain.crt`
+- `cluster-proxy-url` — hypervisor public URL for OpenShift cluster-wide proxy config
+- `cert-manager-intermediate-ca.yaml` — manual Secret + ClusterIssuer manifest
+
+**OpenShift cluster-wide proxy and root CA trust** (enabled by default):
+
+When `ocp_configure_cluster_proxy` is true (default), the playbooks enforce this safe order:
+
+1. **`setup-proxy.yml`** — PKI + Squid in **forward-proxy mode** (MITM deferred)
+2. **`configure-cluster-proxy.yml`** — apply root CA ConfigMap + `spec.trustedCA.name`, wait for worker MCP rollout, then set proxy URLs
+3. **`enable-proxy-mitm.yml`** — re-enable Squid SSL bump only after nodes trust the lab root CA
+
+Set `-e ocp_configure_cluster_proxy=false` to skip cluster Proxy configuration entirely.
+
+The cluster proxy playbook refuses to run if:
+
+- `certs/cluster-proxy-url` or `ocp_cluster_proxy_url` references `localhost`
+- The rendered trust bundle ConfigMap lacks a PEM certificate
+- `spec.trustedCA.name` is not wired to the ConfigMap after phase 1
+- The hypervisor proxy is unreachable from the Ansible controller
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `ocp_configure_cluster_proxy` | `true` | Set `false` to skip cluster Proxy configuration |
+| `proxy_ssl_bump_enabled` | auto | set `false` in `setup-proxy.yml` when cluster proxy is enabled; forced `true` in `enable-proxy-mitm.yml` |
+| `ocp_cluster_proxy_url` | `""` | Override auto-detected URL from `certs/cluster-proxy-url` |
+| `ocp_cluster_no_proxy_extra` | `""` | Extra hosts/CIDRs appended to cluster `noProxy` |
+
+**Automated ClusterIssuer configuration** (enabled by default):
+
+Step 11 in [`site.yml`](site.yml) applies the intermediate CA to cert-manager. Requires cert-manager Operator installed on the cluster and a valid kubeconfig:
+
+```bash
+ansible-playbook site.yml \
+  -e vnc_password="..." \
+  ...
+```
+
+Or via the OpenShift stack (runs after `connect-cluster.yml`):
+
+```bash
+ansible-playbook playbooks/openshift/site.yml
+```
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `cert_manager_configure_issuer` | `true` | Set `false` to skip Secret + ClusterIssuer creation |
+| `cert_manager_namespace` | `cert-manager` | Namespace for the CA Secret |
+| `cert_manager_intermediate_secret_name` | `mirror-operator-intermediate-ca` | TLS Secret name referenced by ClusterIssuer |
+
+Manual alternative:
+
+```bash
+oc apply -f certs/cert-manager-intermediate-ca.yaml
+```
+
+Issue certificates with:
+
+```yaml
+spec:
+  issuerRef:
+    name: mirror-operator-intermediate-ca
+    kind: ClusterIssuer
+```
+
+The RHEL mirror workstation kickstart trusts the root CA and sets proxy environment variables automatically when `proxy_enabled` is true.
+
 ## Input summary
 
 **Must provide:**
@@ -210,10 +304,10 @@ Config from [`templates/sushy-emulator.conf.j2`](templates/sushy-emulator.conf.j
 
 ## OpenShift stack (separate)
 
-To configure OpenShift post-install (worker scaling, gp3-high-perf StorageClass, standalone NooBaa/ODF):
+To configure OpenShift post-install (cluster proxy/CA trust, ClusterIssuer, worker scaling, gp3-high-perf StorageClass, standalone NooBaa/ODF):
 
 ```bash
 ansible-playbook playbooks/openshift/site.yml
 ```
 
-Requires `oc` CLI and a valid kubeconfig (`KUBECONFIG` or `~/.kube/config`). See `group_vars/all.yml` for OpenShift/ODF variable defaults.
+Requires `oc` CLI, a valid kubeconfig (`KUBECONFIG` or `~/.kube/config`), and cert-manager Operator for step 11. Cluster proxy (step 10) is on by default — set `-e ocp_configure_cluster_proxy=false` to skip. Set `-e cert_manager_configure_issuer=false` to skip the ClusterIssuer step. PKI artifacts must exist in `certs/` (exported by `setup-proxy.yml` during the hypervisor run). See `group_vars/all.yml` for OpenShift/ODF variable defaults.

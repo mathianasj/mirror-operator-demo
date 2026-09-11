@@ -1,0 +1,327 @@
+---
+- name: Configure OpenShift cluster-wide proxy and trust lab root CA
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Skip cluster proxy configuration when disabled
+      ansible.builtin.meta: end_play
+      when: not ocp_configure_cluster_proxy | bool
+
+    - name: Skip when proxy/PKI generation is disabled
+      ansible.builtin.meta: end_play
+      when: not proxy_enabled | bool
+
+    - name: Check root CA exists locally
+      ansible.builtin.stat:
+        path: "{{ pki_local_export_path }}/root-ca.crt"
+      register: root_ca_stat
+
+    - name: Fail when PKI artifacts are missing
+      ansible.builtin.fail:
+        msg: >-
+          Root CA not found at {{ pki_local_export_path }}/root-ca.crt.
+          Run site.yml through setup-proxy.yml first.
+      when: not root_ca_stat.stat.exists
+
+    - name: Check exported cluster proxy URL exists locally
+      ansible.builtin.stat:
+        path: "{{ pki_local_export_path }}/cluster-proxy-url"
+      register: cluster_proxy_url_stat
+
+    - name: Fail when cluster proxy URL is not available
+      ansible.builtin.fail:
+        msg: >-
+          Cluster proxy URL not found at {{ pki_local_export_path }}/cluster-proxy-url
+          and ocp_cluster_proxy_url is not set. Run setup-proxy.yml or set
+          ocp_cluster_proxy_url explicitly (e.g. http://<hypervisor-public-ip>:3128).
+      when:
+        - ocp_cluster_proxy_url | default('') | length == 0
+        - not cluster_proxy_url_stat.stat.exists
+
+    - name: Read exported cluster proxy URL
+      ansible.builtin.slurp:
+        src: "{{ pki_local_export_path }}/cluster-proxy-url"
+      register: cluster_proxy_url_slurp
+      when: ocp_cluster_proxy_url | default('') | length == 0
+
+    - name: Set cluster proxy URL fact
+      ansible.builtin.set_fact:
+        ocp_effective_cluster_proxy_url: >-
+          {{
+            ocp_cluster_proxy_url
+            if (ocp_cluster_proxy_url | default('') | length > 0)
+            else (cluster_proxy_url_slurp.content | b64decode | trim)
+          }}
+
+    - name: Fail when cluster proxy URL points at localhost
+      ansible.builtin.fail:
+        msg: >-
+          Cluster proxy URL '{{ ocp_effective_cluster_proxy_url }}' uses localhost, which
+          will not work from OpenShift nodes. Re-run setup-proxy.yml against the hypervisor
+          public IP or set -e ocp_cluster_proxy_url=http://<hypervisor-public-ip>:3128
+      when: "'localhost' in ocp_effective_cluster_proxy_url or '127.0.0.1' in ocp_effective_cluster_proxy_url"
+
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "Kubeconfig not found at {{ ocp_kubeconfig }}. Set KUBECONFIG or run connect-cluster.yml first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster API is reachable
+      ansible.builtin.command:
+        cmd: oc get --raw /readyz
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: ocp_readyz
+      changed_when: false
+      failed_when: ocp_readyz.rc != 0
+
+    - name: Verify hypervisor proxy is reachable from the controller
+      ansible.builtin.uri:
+        url: "{{ ocp_effective_cluster_proxy_url }}"
+        method: GET
+        status_code: [400, 403, 407, 501]
+        follow_redirects: none
+      register: proxy_reachability
+      failed_when: false
+
+    - name: Fail when hypervisor proxy is unreachable from the controller
+      ansible.builtin.fail:
+        msg: >-
+          Cannot reach proxy at {{ ocp_effective_cluster_proxy_url }} from this host
+          (status={{ proxy_reachability.status | default('connection failed') }}).
+          OpenShift nodes must be able to reach the hypervisor on port {{ proxy_listen_port }}.
+      when: proxy_reachability.status is not defined or proxy_reachability.status == -1
+
+    - name: Get cluster network configuration
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Network
+        name: cluster
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: cluster_network_info
+
+    - name: Build cluster noProxy list
+      ansible.builtin.set_fact:
+        ocp_effective_cluster_no_proxy: >-
+          {{
+            [
+              proxy_no_proxy,
+              '.svc',
+              '.cluster.local',
+              cluster_network_info.resources[0].status.serviceNetwork | default([]) | join(','),
+              cluster_network_info.resources[0].status.clusterNetwork | default([]) | map(attribute='cidr') | list | join(','),
+              ocp_cluster_no_proxy_extra | default('')
+            ]
+            | map('string')
+            | map('trim')
+            | reject('equalto', '')
+            | join(',')
+            | regex_replace(',+', ',')
+            | regex_replace('^,|,$', '')
+          }}
+      when: cluster_network_info.resources | length > 0
+
+    - name: Fall back to static noProxy list
+      ansible.builtin.set_fact:
+        ocp_effective_cluster_no_proxy: "{{ proxy_no_proxy }},.svc,.cluster.local{{ ',' ~ ocp_cluster_no_proxy_extra if (ocp_cluster_no_proxy_extra | default('') | length > 0) else '' }}"
+      when: cluster_network_info.resources | length == 0
+
+    - name: Read root CA PEM for cluster trust bundle
+      ansible.builtin.set_fact:
+        ocp_root_ca_pem: "{{ lookup('file', pki_local_export_path ~ '/root-ca.crt') }}"
+
+    - name: Fail when root CA PEM is empty
+      ansible.builtin.fail:
+        msg: "Root CA at {{ pki_local_export_path }}/root-ca.crt is empty or unreadable."
+      when: ocp_root_ca_pem | length == 0
+
+    - name: Render root CA ConfigMap for cluster trust bundle (phase 1)
+      ansible.builtin.template:
+        src: ../../templates/cluster-trust-bundle-configmap.yaml.j2
+        dest: "{{ pki_local_export_path }}/cluster-trust-bundle-configmap.yaml"
+        mode: "0600"
+
+    - name: Render full cluster Proxy manifest (phase 2)
+      ansible.builtin.template:
+        src: ../../templates/cluster-proxy.yaml.j2
+        dest: "{{ pki_local_export_path }}/cluster-proxy.yaml"
+        mode: "0600"
+
+    - name: Validate rendered trust bundle ConfigMap contains PEM
+      ansible.builtin.command:
+        cmd: grep -Fq "BEGIN CERTIFICATE" {{ pki_local_export_path }}/cluster-trust-bundle-configmap.yaml
+      changed_when: false
+
+    - name: Validate full Proxy manifest references trust bundle ConfigMap
+      ansible.builtin.command:
+        cmd: >-
+          grep -Fq {{ ocp_cluster_trust_bundle_configmap_name | to_json }}
+          {{ pki_local_export_path }}/cluster-proxy.yaml
+      changed_when: false
+
+    - name: Validate full manifest contains proxy URL
+      ansible.builtin.command:
+        cmd: >-
+          grep -Fq {{ ocp_effective_cluster_proxy_url | to_json }}
+          {{ pki_local_export_path }}/cluster-proxy.yaml
+      changed_when: false
+
+    - name: Capture worker MachineConfigPool rendered config before apply
+      ansible.builtin.command:
+        cmd: oc get machineconfigpool worker -o jsonpath='{.status.configuration.name}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: mcp_worker_before
+      changed_when: false
+
+    - name: "Phase 1a — apply root CA ConfigMap in openshift-config"
+      ansible.builtin.command:
+        cmd: oc apply -f {{ pki_local_export_path }}/cluster-trust-bundle-configmap.yaml
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: trust_bundle_cm_apply
+      changed_when: "'configured' in trust_bundle_cm_apply.stdout or 'created' in trust_bundle_cm_apply.stdout"
+
+    - name: "Phase 1b — reference trust bundle ConfigMap from cluster Proxy"
+      ansible.builtin.command:
+        cmd: >-
+          oc patch proxy cluster --type=merge
+          -p '{"spec":{"trustedCA":{"name":"{{ ocp_cluster_trust_bundle_configmap_name }}"}}}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: trust_bundle_proxy_patch
+      changed_when: trust_bundle_proxy_patch.rc == 0
+
+    - name: Verify trust bundle ConfigMap contains lab root CA
+      ansible.builtin.command:
+        cmd: >-
+          oc get configmap {{ ocp_cluster_trust_bundle_configmap_name }}
+          -n {{ ocp_cluster_trust_bundle_namespace }}
+          -o jsonpath='{.data.ca-bundle\.crt}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: trust_bundle_cm_data
+      until: trust_bundle_cm_data.stdout is search("BEGIN CERTIFICATE")
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    - name: Verify cluster Proxy references trust bundle ConfigMap after phase 1
+      ansible.builtin.command:
+        cmd: oc get proxy cluster -o jsonpath='{.spec.trustedCA.name}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: proxy_trusted_ca_name
+      until: proxy_trusted_ca_name.stdout == ocp_cluster_trust_bundle_configmap_name
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    - name: Fail when trustedCA ConfigMap is not wired into cluster Proxy
+      ansible.builtin.fail:
+        msg: >-
+          spec.trustedCA.name is '{{ proxy_trusted_ca_name.stdout | default('empty') }}', expected
+          '{{ ocp_cluster_trust_bundle_configmap_name }}'. Inspect:
+          oc get configmap {{ ocp_cluster_trust_bundle_configmap_name }} -n {{ ocp_cluster_trust_bundle_namespace }} -o yaml
+          oc get proxy cluster -o yaml
+      when: proxy_trusted_ca_name.stdout != ocp_cluster_trust_bundle_configmap_name
+
+    - name: Wait for worker trust bundle rollout before enabling proxy
+      ansible.builtin.command:
+        cmd: >-
+          oc get machineconfigpool worker
+          -o jsonpath='{.status.configuration.name}{" "}{.status.conditions[?(@.type=="Updated")].status}{" "}{.status.conditions[?(@.type=="Updating")].status}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: mcp_worker_trust_status
+      until: >
+        mcp_worker_trust_status.stdout.split()[1] | default('') == 'True' and
+        mcp_worker_trust_status.stdout.split()[2] | default('False') == 'False' and
+        (
+          mcp_worker_trust_status.stdout.split()[0] != mcp_worker_before.stdout or
+          'configured' not in trust_bundle_cm_apply.stdout
+        )
+      retries: "{{ ocp_cluster_proxy_mcp_wait_retries }}"
+      delay: "{{ ocp_cluster_proxy_mcp_wait_delay }}"
+      changed_when: false
+
+    - name: "Phase 2 — apply cluster-wide proxy settings"
+      ansible.builtin.command:
+        cmd: oc apply -f {{ pki_local_export_path }}/cluster-proxy.yaml
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: proxy_apply
+      changed_when: "'configured' in proxy_apply.stdout or 'created' in proxy_apply.stdout"
+
+    - name: Verify cluster Proxy spec contains proxy URL and trustedCA after phase 2
+      ansible.builtin.command:
+        cmd: >-
+          oc get proxy cluster
+          -o jsonpath='http={.spec.httpProxy} https={.spec.httpsProxy} trustedCA={.spec.trustedCA.name}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: proxy_final_spec
+      changed_when: false
+
+    - name: Fail when final cluster Proxy spec is incomplete
+      ansible.builtin.fail:
+        msg: >-
+          Cluster Proxy spec is incomplete after apply: {{ proxy_final_spec.stdout }}.
+          Expected http/https proxy {{ ocp_effective_cluster_proxy_url }} and
+          trustedCA.name={{ ocp_cluster_trust_bundle_configmap_name }}.
+      when: >
+        ocp_effective_cluster_proxy_url not in proxy_final_spec.stdout or
+        ocp_cluster_trust_bundle_configmap_name not in proxy_final_spec.stdout
+
+    - name: Wait for worker MachineConfigPool rollout to complete
+      ansible.builtin.command:
+        cmd: >-
+          oc get machineconfigpool worker
+          -o jsonpath='{.status.configuration.name}{" "}{.status.conditions[?(@.type=="Updated")].status}{" "}{.status.conditions[?(@.type=="Updating")].status}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: mcp_worker_status
+      until: >
+        mcp_worker_status.stdout.split()[1] | default('') == 'True' and
+        mcp_worker_status.stdout.split()[2] | default('False') == 'False'
+      retries: "{{ ocp_cluster_proxy_mcp_wait_retries }}"
+      delay: "{{ ocp_cluster_proxy_mcp_wait_delay }}"
+      changed_when: false
+
+    - name: Wait for master MachineConfigPool rollout to complete
+      ansible.builtin.command:
+        cmd: >-
+          oc get machineconfigpool master
+          -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}{" "}{.status.conditions[?(@.type=="Updating")].status}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: mcp_master_status
+      until: >
+        mcp_master_status.stdout.split()[0] | default('') == 'True' and
+        mcp_master_status.stdout.split()[1] | default('False') == 'False'
+      retries: "{{ ocp_cluster_proxy_mcp_wait_retries }}"
+      delay: "{{ ocp_cluster_proxy_mcp_wait_delay }}"
+      changed_when: false
+
+    - name: Display cluster proxy summary
+      ansible.builtin.debug:
+        msg:
+          - "Cluster httpProxy/httpsProxy: {{ ocp_effective_cluster_proxy_url }}"
+          - "Cluster noProxy: {{ ocp_effective_cluster_no_proxy }}"
+          - "Root CA ConfigMap: {{ ocp_cluster_trust_bundle_namespace }}/{{ ocp_cluster_trust_bundle_configmap_name }}"
+          - "Cluster Proxy spec.trustedCA.name wired before proxy rollout completes"
+          - "Trust bundle manifest: {{ pki_local_export_path }}/cluster-trust-bundle-configmap.yaml"
+          - "Full proxy manifest: {{ pki_local_export_path }}/cluster-proxy.yaml"
+          - "MachineConfig pools report Updated=True (nodes may have rebooted during rollout)"
+
+- import_playbook: ../enable-proxy-mitm.yml

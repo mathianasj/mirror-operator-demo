@@ -1,0 +1,51 @@
+# Mirror Operator corporate proxy simulation
+# Managed by Ansible — do not edit manually
+
+acl SSL_ports port 443
+acl Safe_ports port 80
+acl Safe_ports port 443
+acl Safe_ports port 1025-65535
+acl CONNECT method CONNECT
+
+{% for cidr in proxy_allowed_networks %}
+acl allowed_clients src {{ cidr }}
+{% endfor %}
+
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+{% if proxy_ssl_bump_enabled | bool %}
+# Allow at SslBump step 1 so CONNECT is not denied then bumped into a 403 page
+acl step1 at_step SslBump1
+http_access allow allowed_clients step1
+{% endif %}
+http_access allow allowed_clients
+http_access allow all
+http_access deny all
+
+{% if proxy_ssl_bump_enabled | bool %}
+http_port {{ proxy_listen_address }}:{{ proxy_listen_port }} ssl-bump \
+    cert={{ pki_proxy_signing_cert }} \
+    key={{ pki_proxy_signing_key }} \
+    generate-host-certificates=on \
+    dynamic_cert_mem_cache_size=4MB
+
+sslcrtd_program /usr/lib64/squid/security_file_certgen -s {{ proxy_ssl_db_path }} -M {{ proxy_ssl_db_size }}
+sslcrtd_children 5 startup=1 idle=1
+
+ssl_bump peek step1
+ssl_bump bump all
+
+sslproxy_cert_error allow all
+{% else %}
+# Forward-proxy mode: MITM deferred until OpenShift nodes trust the lab root CA
+http_port {{ proxy_listen_address }}:{{ proxy_listen_port }}
+{% endif %}
+
+cache_dir ufs /var/spool/squid 100 16 256
+cache deny all
+coredump_dir /var/spool/squid
+
+access_log daemon:/var/log/squid/access.log squid
+cache_log /var/log/squid/cache.log
+
+visible_hostname {{ proxy_hostname }}

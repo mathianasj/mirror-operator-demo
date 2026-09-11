@@ -26,6 +26,8 @@ isolated_network_gateway: 192.168.100.1
 isolated_network_dhcp_start: 192.168.100.100
 isolated_network_dhcp_end: 192.168.100.200
 isolated_network_dns_records:
+  - hostname: proxy.example.com
+    ip: 192.168.100.1
   - hostname: mirror.example.com
     ip: 192.168.100.10
   - hostname: api.c0.example.com
@@ -71,6 +73,57 @@ sno_vm_disk_size_gb: 120
 
 # NTP
 ntp_allowed_network: 192.168.100.0/24
+
+# Corporate proxy (MITM / SSL bump)
+proxy_enabled: true
+proxy_listen_address: "0.0.0.0"
+proxy_listen_port: 3128
+proxy_hostname: proxy.example.com
+proxy_no_proxy: "localhost,127.0.0.1,192.168.100.0/24,.example.com"
+proxy_ssl_db_path: /var/spool/squid/ssl_db
+proxy_ssl_db_size: 20MB
+# Source networks allowed to use the proxy (plus built-in "all" ACL as fallback in squid.conf).
+# Note: Squid does not treat 0.0.0.0/0 as match-all — use RFC1918 + public client CIDRs instead.
+proxy_allowed_networks:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 127.0.0.0/8
+# Set per-playbook via set_fact in setup-proxy.yml / enable-proxy-mitm.yml
+proxy_ssl_bump_enabled: true
+
+# PKI — root CA for proxy SSL bump, intermediate CA for cert-manager
+pki_base_path: /etc/pki/mirror-operator
+pki_organization: "Mirror Operator Lab"
+pki_organizational_unit: "Certificate Authority"
+pki_root_ca_common_name: "Mirror Operator Root CA"
+pki_intermediate_ca_common_name: "Mirror Operator Intermediate CA"
+pki_root_ca_validity_days: 3650
+pki_intermediate_ca_validity_days: 1825
+pki_root_ca_key: "{{ pki_base_path }}/root/ca.key"
+pki_root_ca_cert: "{{ pki_base_path }}/root/ca.crt"
+pki_intermediate_ca_key: "{{ pki_base_path }}/intermediate/ca.key"
+pki_intermediate_ca_cert: "{{ pki_base_path }}/intermediate/ca.crt"
+pki_intermediate_ca_chain: "{{ pki_base_path }}/intermediate/ca-chain.crt"
+pki_proxy_signing_key: "{{ pki_base_path }}/proxy/signing.key"
+pki_proxy_signing_cert: "{{ pki_base_path }}/proxy/signing.crt"
+repo_root: "{{ ansible_config_file | dirname }}"
+pki_local_export_path: "{{ repo_root }}/certs"
+
+# cert-manager ClusterIssuer (requires cert-manager operator + kubeconfig)
+cert_manager_configure_issuer: true  # set false to skip ClusterIssuer configuration on OpenShift
+cert_manager_namespace: cert-manager
+cert_manager_issuer_name: mirror-operator-intermediate-ca
+cert_manager_intermediate_secret_name: mirror-operator-intermediate-ca
+
+# OpenShift cluster-wide proxy + root CA trust (requires kubeconfig)
+ocp_configure_cluster_proxy: true  # set false to skip cluster Proxy configuration
+ocp_cluster_proxy_url: ""  # default: read from certs/cluster-proxy-url exported by setup-proxy.yml
+ocp_cluster_no_proxy_extra: ""  # appended to auto-detected cluster noProxy list
+ocp_cluster_trust_bundle_configmap_name: user-ca-bundle
+ocp_cluster_trust_bundle_namespace: openshift-config
+ocp_cluster_proxy_mcp_wait_retries: 60
+ocp_cluster_proxy_mcp_wait_delay: 20
 
 # Redfish / sushy-emulator
 sushy_emulator_listen_ip: 192.168.100.1

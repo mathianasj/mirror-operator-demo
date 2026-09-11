@@ -1,0 +1,130 @@
+---
+- name: Configure cert-manager ClusterIssuer with Mirror Operator intermediate CA
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../group_vars/all.yml
+
+  tasks:
+    - name: Skip ClusterIssuer configuration when disabled
+      ansible.builtin.meta: end_play
+      when: not cert_manager_configure_issuer | bool
+
+    - name: Skip when proxy/PKI generation is disabled
+      ansible.builtin.meta: end_play
+      when: not proxy_enabled | bool
+
+    - name: Check intermediate CA chain exists locally
+      ansible.builtin.stat:
+        path: "{{ pki_local_export_path }}/intermediate-ca-chain.crt"
+      register: intermediate_chain_stat
+
+    - name: Skip when PKI artifacts are missing
+      ansible.builtin.debug:
+        msg: >-
+          Skipping ClusterIssuer — PKI artifacts not found in {{ pki_local_export_path }}.
+          Run site.yml through setup-proxy.yml first to export the intermediate CA.
+      when: not intermediate_chain_stat.stat.exists
+
+    - name: End play when PKI artifacts are missing
+      ansible.builtin.meta: end_play
+      when: not intermediate_chain_stat.stat.exists
+
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_kubeconfig }}"
+      register: kubeconfig_stat
+
+    - name: Fail when kubeconfig is missing
+      ansible.builtin.fail:
+        msg: >-
+          Kubeconfig not found at {{ ocp_kubeconfig }}.
+          Set KUBECONFIG or run connect-cluster.yml first.
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cert-manager CRD is installed
+      kubernetes.core.k8s_info:
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: clusterissuers.cert-manager.io
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: cert_manager_crd
+
+    - name: Fail when cert-manager is not installed
+      ansible.builtin.fail:
+        msg: >-
+          cert-manager is not installed (clusterissuers.cert-manager.io CRD missing).
+          Install the cert-manager Operator on OpenShift, then re-run site.yml
+          (or set cert_manager_configure_issuer=false to skip).
+      when: cert_manager_crd.resources | length == 0
+
+    - name: Ensure cert-manager namespace exists
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ cert_manager_namespace }}"
+
+    - name: Apply intermediate CA Secret for cert-manager
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ cert_manager_intermediate_secret_name }}"
+            namespace: "{{ cert_manager_namespace }}"
+          type: kubernetes.io/tls
+          stringData:
+            tls.crt: "{{ lookup('file', pki_local_export_path ~ '/intermediate-ca-chain.crt') }}"
+            tls.key: "{{ lookup('file', pki_local_export_path ~ '/intermediate-ca.key') }}"
+
+    - name: Apply intermediate CA ClusterIssuer
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: "{{ cert_manager_issuer_name }}"
+          spec:
+            ca:
+              secretName: "{{ cert_manager_intermediate_secret_name }}"
+
+    - name: Wait for ClusterIssuer to become ready
+      kubernetes.core.k8s_info:
+        api_version: cert-manager.io/v1
+        kind: ClusterIssuer
+        name: "{{ cert_manager_issuer_name }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: clusterissuer_info
+      until: >
+        clusterissuer_info.resources | length > 0 and
+        (
+          clusterissuer_info.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready')
+          | selectattr('status', 'equalto', 'True')
+          | list
+          | length
+        ) > 0
+      retries: 30
+      delay: 10
+
+    - name: Display ClusterIssuer summary
+      ansible.builtin.debug:
+        msg:
+          - "ClusterIssuer: {{ cert_manager_issuer_name }}"
+          - "Secret: {{ cert_manager_namespace }}/{{ cert_manager_intermediate_secret_name }}"
+          - "CA chain source: {{ pki_local_export_path }}/intermediate-ca-chain.crt"
+          - "Issue certificates with issuerRef.name={{ cert_manager_issuer_name }}, kind=ClusterIssuer"

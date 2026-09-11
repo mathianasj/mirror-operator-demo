@@ -5,6 +5,9 @@
 - name: Configure host with KVM, GNOME, and VNC
   ansible.builtin.import_playbook: playbooks/configure-host.yml
 
+- name: Set up corporate MITM proxy and PKI
+  ansible.builtin.import_playbook: playbooks/setup-proxy.yml
+
 - name: Create libvirt networks
   ansible.builtin.import_playbook: playbooks/create-networks.yml
 
@@ -22,3 +25,9 @@
 
 - name: Set up Redfish simulation
   ansible.builtin.import_playbook: playbooks/setup-redfish.yml
+
+- name: Configure OpenShift cluster-wide proxy and root CA trust
+  ansible.builtin.import_playbook: playbooks/openshift/configure-cluster-proxy.yml
+
+- name: Configure cert-manager ClusterIssuer with lab intermediate CA
+  ansible.builtin.import_playbook: playbooks/openshift/configure-cert-manager-issuer.yml

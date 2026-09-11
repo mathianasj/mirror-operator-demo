@@ -1,0 +1,377 @@
+---
+- name: Set up corporate MITM proxy and PKI
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Skip proxy setup when disabled
+      ansible.builtin.meta: end_play
+      when: not proxy_enabled | bool
+
+    - name: Defer Squid SSL bump when OpenShift cluster proxy will be configured
+      ansible.builtin.set_fact:
+        proxy_ssl_bump_enabled: false
+      when: ocp_configure_cluster_proxy | bool
+
+    - name: Enable Squid SSL bump immediately when cluster proxy is not in use
+      ansible.builtin.set_fact:
+        proxy_ssl_bump_enabled: true
+      when: not (ocp_configure_cluster_proxy | bool)
+
+    # --- PKI directories ---
+
+    - name: Create PKI directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ pki_base_path }}/root"
+        - "{{ pki_base_path }}/intermediate"
+        - "{{ pki_base_path }}/proxy"
+
+    - name: Check if root CA already exists
+      ansible.builtin.stat:
+        path: "{{ pki_root_ca_cert }}"
+      register: root_ca_stat
+
+    - name: Deploy OpenSSL config for root CA
+      ansible.builtin.template:
+        src: ../templates/openssl-root-ca.cnf.j2
+        dest: "{{ pki_base_path }}/root/openssl.cnf"
+        mode: "0644"
+
+    - name: Generate root CA private key
+      ansible.builtin.command: >
+        openssl genrsa -out {{ pki_root_ca_key }} 4096
+      args:
+        creates: "{{ pki_root_ca_key }}"
+
+    - name: Generate root CA certificate
+      ansible.builtin.command: >
+        openssl req -x509 -new -nodes
+        -key {{ pki_root_ca_key }}
+        -sha256 -days {{ pki_root_ca_validity_days }}
+        -out {{ pki_root_ca_cert }}
+        -config {{ pki_base_path }}/root/openssl.cnf
+      args:
+        creates: "{{ pki_root_ca_cert }}"
+
+    - name: Set root CA key permissions
+      ansible.builtin.file:
+        path: "{{ pki_root_ca_key }}"
+        mode: "0600"
+
+    # --- Intermediate CA ---
+
+    - name: Deploy OpenSSL config for intermediate CA
+      ansible.builtin.template:
+        src: ../templates/openssl-intermediate-ca.cnf.j2
+        dest: "{{ pki_base_path }}/intermediate/openssl.cnf"
+        mode: "0644"
+
+    - name: Generate intermediate CA private key
+      ansible.builtin.command: >
+        openssl genrsa -out {{ pki_intermediate_ca_key }} 4096
+      args:
+        creates: "{{ pki_intermediate_ca_key }}"
+
+    - name: Generate intermediate CA CSR
+      ansible.builtin.command: >
+        openssl req -new -nodes
+        -key {{ pki_intermediate_ca_key }}
+        -sha256
+        -out {{ pki_base_path }}/intermediate/ca.csr
+        -config {{ pki_base_path }}/intermediate/openssl.cnf
+      args:
+        creates: "{{ pki_base_path }}/intermediate/ca.csr"
+
+    - name: Sign intermediate CA certificate with root CA
+      ansible.builtin.command: >
+        openssl x509 -req
+        -in {{ pki_base_path }}/intermediate/ca.csr
+        -CA {{ pki_root_ca_cert }}
+        -CAkey {{ pki_root_ca_key }}
+        -CAcreateserial
+        -out {{ pki_intermediate_ca_cert }}
+        -days {{ pki_intermediate_ca_validity_days }}
+        -sha256
+        -extfile {{ pki_base_path }}/intermediate/openssl.cnf
+        -extensions v3_ca
+      args:
+        creates: "{{ pki_intermediate_ca_cert }}"
+
+    - name: Build intermediate CA chain bundle
+      ansible.builtin.shell: |
+        cat {{ pki_intermediate_ca_cert }} {{ pki_root_ca_cert }} > {{ pki_intermediate_ca_chain }}
+      args:
+        creates: "{{ pki_intermediate_ca_chain }}"
+
+    - name: Set intermediate CA key permissions
+      ansible.builtin.file:
+        path: "{{ pki_intermediate_ca_key }}"
+        mode: "0600"
+
+    # --- Trust root CA on hypervisor ---
+
+    - name: Install root CA into system trust store
+      ansible.builtin.copy:
+        src: "{{ pki_root_ca_cert }}"
+        dest: /etc/pki/ca-trust/source/anchors/mirror-operator-root-ca.crt
+        remote_src: true
+        mode: "0644"
+      notify: Update CA trust
+
+    # --- Squid proxy with SSL bump ---
+
+    - name: Install Squid and SELinux utilities
+      ansible.builtin.dnf:
+        name:
+          - squid
+          - policycoreutils-python-utils
+        state: present
+
+    - name: Install proxy signing certificate for Squid
+      ansible.builtin.copy:
+        src: "{{ pki_root_ca_cert }}"
+        dest: "{{ pki_proxy_signing_cert }}"
+        remote_src: true
+        owner: root
+        group: squid
+        mode: "0644"
+
+    - name: Install proxy signing key for Squid
+      ansible.builtin.copy:
+        src: "{{ pki_root_ca_key }}"
+        dest: "{{ pki_proxy_signing_key }}"
+        remote_src: true
+        owner: root
+        group: squid
+        mode: "0640"
+      notify: Restart Squid
+
+    - name: Create Squid spool directory
+      ansible.builtin.file:
+        path: /var/spool/squid
+        state: directory
+        owner: squid
+        group: squid
+        mode: "0750"
+
+    - name: Initialize Squid SSL bump infrastructure
+      ansible.builtin.import_tasks: tasks/squid-ssl-bump.yml
+      when: proxy_ssl_bump_enabled | bool
+
+    - name: Create Squid state directory
+      ansible.builtin.file:
+        path: /var/lib/squid
+        state: directory
+        owner: squid
+        group: squid
+        mode: "0750"
+
+    - name: Deploy Squid configuration
+      ansible.builtin.template:
+        src: ../templates/squid.conf.j2
+        dest: /etc/squid/squid.conf
+        mode: "0644"
+        validate: "squid -k parse -f %s"
+      notify: Restart Squid
+
+    - name: Apply Squid configuration before starting service
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start Squid
+      ansible.builtin.systemd:
+        name: squid
+        enabled: true
+        state: started
+
+    - name: Open proxy port on libvirt firewalld zone
+      ansible.posix.firewalld:
+        port: "{{ proxy_listen_port }}/tcp"
+        zone: libvirt
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Open proxy port on public firewalld zone
+      ansible.posix.firewalld:
+        port: "{{ proxy_listen_port }}/tcp"
+        zone: public
+        permanent: true
+        immediate: true
+        state: enabled
+
+    # --- System-wide proxy environment ---
+
+    - name: Create environment.d directory
+      ansible.builtin.file:
+        path: /etc/environment.d
+        state: directory
+        mode: "0755"
+
+    - name: Deploy system-wide proxy environment
+      ansible.builtin.template:
+        src: ../templates/proxy-environment.conf.j2
+        dest: /etc/environment.d/proxy.conf
+        mode: "0644"
+
+    - name: Configure DNF to use proxy
+      ansible.builtin.lineinfile:
+        path: /etc/dnf/dnf.conf
+        regexp: '^proxy='
+        line: "proxy=http://{{ isolated_network_gateway }}:{{ proxy_listen_port }}"
+        create: true
+        mode: "0644"
+
+    # --- Export PKI artifacts to local controller ---
+
+    - name: Create local certs export directory on controller
+      ansible.builtin.file:
+        path: "{{ pki_local_export_path }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch root CA certificate to controller
+      ansible.builtin.fetch:
+        src: "{{ pki_root_ca_cert }}"
+        dest: "{{ pki_local_export_path }}/root-ca.crt"
+        flat: true
+
+    - name: Fetch intermediate CA certificate to controller
+      ansible.builtin.fetch:
+        src: "{{ pki_intermediate_ca_cert }}"
+        dest: "{{ pki_local_export_path }}/intermediate-ca.crt"
+        flat: true
+
+    - name: Fetch intermediate CA chain to controller
+      ansible.builtin.fetch:
+        src: "{{ pki_intermediate_ca_chain }}"
+        dest: "{{ pki_local_export_path }}/intermediate-ca-chain.crt"
+        flat: true
+
+    - name: Fetch intermediate CA private key to controller
+      ansible.builtin.fetch:
+        src: "{{ pki_intermediate_ca_key }}"
+        dest: "{{ pki_local_export_path }}/intermediate-ca.key"
+        flat: true
+
+    - name: Determine cluster-facing proxy host address
+      ansible.builtin.set_fact:
+        ocp_cluster_proxy_host: >-
+          {{
+            hostvars[inventory_hostname]['ansible_host']
+            | default(ansible_host)
+            | default(inventory_hostname)
+          }}
+
+    - name: Fail when hypervisor address is unsuitable for OpenShift cluster proxy URL
+      ansible.builtin.fail:
+        msg: >-
+          Cannot export a cluster-facing proxy URL because the hypervisor address is
+          '{{ ocp_cluster_proxy_host }}'. OpenShift nodes cannot use localhost/127.0.0.1.
+          Run setup-proxy.yml with an inventory that sets ansible_host to the hypervisor
+          public IP (e.g. -i "18.191.228.60,").
+      when: ocp_cluster_proxy_host is match('^(localhost|127\\.0\\.0\\.1)$')
+
+    - name: Export cluster-facing proxy URL for OpenShift
+      ansible.builtin.copy:
+        content: "http://{{ ocp_cluster_proxy_host }}:{{ proxy_listen_port }}"
+        dest: "{{ pki_local_export_path }}/cluster-proxy-url"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Validate exported cluster proxy URL does not reference localhost
+      ansible.builtin.command:
+        cmd: grep -Ev 'localhost|127\\.0\\.0\\.1' {{ pki_local_export_path }}/cluster-proxy-url
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Read intermediate CA chain for cert-manager manifest
+      ansible.builtin.slurp:
+        src: "{{ pki_intermediate_ca_chain }}"
+      register: intermediate_chain_slurp
+
+    - name: Read intermediate CA key for cert-manager manifest
+      ansible.builtin.slurp:
+        src: "{{ pki_intermediate_ca_key }}"
+      register: intermediate_key_slurp
+
+    - name: Render cert-manager ClusterIssuer manifest on controller
+      ansible.builtin.template:
+        src: ../templates/cert-manager-intermediate-ca.yaml.j2
+        dest: "{{ pki_local_export_path }}/cert-manager-intermediate-ca.yaml"
+        mode: "0600"
+      vars:
+        cert_manager_intermediate_chain_pem: "{{ intermediate_chain_slurp.content | b64decode }}"
+        cert_manager_intermediate_key_pem: "{{ intermediate_key_slurp.content | b64decode }}"
+      delegate_to: localhost
+      become: false
+
+    # --- Validate ---
+
+    - name: Flush handlers before health check
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check Squid service status
+      ansible.builtin.systemd:
+        name: squid
+      register: squid_service
+
+    - name: Show Squid logs when service is not active
+      ansible.builtin.command: journalctl -u squid -n 40 --no-pager
+      register: squid_journal
+      changed_when: false
+      when: squid_service.status.ActiveState != 'active'
+
+    - name: Fail when Squid service is not active
+      ansible.builtin.fail:
+        msg: "{{ squid_journal.stdout | default('Squid failed to start. Check journalctl -u squid') }}"
+      when: squid_service.status.ActiveState != 'active'
+
+    - name: Verify Squid is listening on proxy port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ proxy_listen_port }}"
+        timeout: 30
+
+    - name: Check if isolated network gateway is configured
+      ansible.builtin.shell: ip -4 addr | grep -Fq '{{ isolated_network_gateway }}/'
+      register: isolated_gateway_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display proxy and PKI summary
+      ansible.builtin.debug:
+        msg:
+          - "HTTP/HTTPS proxy: http://{{ proxy_hostname }}:{{ proxy_listen_port }} ({{ isolated_network_gateway }}:{{ proxy_listen_port }} on isolated network)"
+          - "Squid listening on 127.0.0.1:{{ proxy_listen_port }} (all interfaces)"
+          - >-
+            Isolated gateway {{ isolated_network_gateway }}:{{
+            proxy_listen_port }}:
+            {{ 'ready' if isolated_gateway_check.rc == 0 else 'pending — run create-networks.yml to bring up virbr-isolated' }}
+          - "Cluster-facing proxy URL: {{ pki_local_export_path }}/cluster-proxy-url"
+          - "Root CA: {{ pki_root_ca_cert }}"
+          - "Intermediate CA: {{ pki_intermediate_ca_cert }}"
+          - >-
+            Squid mode:
+            {{ 'SSL bump (MITM)' if (proxy_ssl_bump_enabled | bool) else 'forward proxy only — MITM deferred until OpenShift trust bundle rollout' }}
+          - "cert-manager manifest: {{ pki_local_export_path }}/cert-manager-intermediate-ca.yaml"
+          - "ClusterIssuer configured by default at end of site.yml (set cert_manager_configure_issuer=false to skip)"
+
+  handlers:
+    - name: Update CA trust
+      ansible.builtin.command: update-ca-trust extract
+      changed_when: true
+
+    - name: Restart Squid
+      ansible.builtin.systemd:
+        name: squid
+        state: restarted

@@ -1,0 +1,107 @@
+---
+- name: Prepare hypervisor target for Squid MITM enablement
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Skip MITM enablement when cluster proxy configuration is disabled
+      ansible.builtin.meta: end_play
+      when: not ocp_configure_cluster_proxy | bool
+
+    - name: Skip when proxy/PKI generation is disabled
+      ansible.builtin.meta: end_play
+      when: not proxy_enabled | bool
+
+    - name: Register hypervisors already in inventory
+      ansible.builtin.set_fact:
+        mitm_hypervisor_hosts: "{{ groups['hypervisors'] | default([]) }}"
+
+    - name: Read cluster proxy URL when hypervisor is not in inventory
+      ansible.builtin.slurp:
+        src: "{{ pki_local_export_path }}/cluster-proxy-url"
+      register: cluster_proxy_url_slurp
+      when: mitm_hypervisor_hosts | length == 0
+
+    - name: Add hypervisor host from cluster proxy URL
+      ansible.builtin.add_host:
+        name: "{{ cluster_proxy_url_slurp.content | b64decode | trim | urlsplit('hostname') }}"
+        groups: mitm_hypervisors
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ec2_key_local_path }}/{{ ec2_key_name }}.pem"
+      when: mitm_hypervisor_hosts | length == 0
+
+    - name: Mirror in-memory hypervisors into mitm_hypervisors group
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: mitm_hypervisors
+        ansible_user: "{{ hostvars[item]['ansible_user'] | default('ec2-user') }}"
+        ansible_ssh_private_key_file: "{{ hostvars[item]['ansible_ssh_private_key_file'] | default(ec2_key_local_path ~ '/' ~ ec2_key_name ~ '.pem') }}"
+      loop: "{{ mitm_hypervisor_hosts }}"
+      when: mitm_hypervisor_hosts | length > 0
+
+- name: Enable Squid SSL bump on hypervisor after cluster trust bundle rollout
+  hosts: mitm_hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Create Squid spool directory
+      ansible.builtin.file:
+        path: /var/spool/squid
+        state: directory
+        owner: squid
+        group: squid
+        mode: "0750"
+
+    - name: Initialize Squid SSL bump infrastructure
+      ansible.builtin.import_tasks: tasks/squid-ssl-bump.yml
+
+    - name: Deploy Squid MITM configuration
+      ansible.builtin.template:
+        src: ../templates/squid.conf.j2
+        dest: /etc/squid/squid.conf
+        mode: "0644"
+        validate: "squid -k parse -f %s"
+      vars:
+        proxy_ssl_bump_enabled: true
+      notify: Restart Squid
+
+    - name: Apply Squid configuration before health check
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify deployed Squid configuration enables SSL bump
+      ansible.builtin.command:
+        cmd: grep -Eq 'http_port .* ssl-bump|ssl_bump' /etc/squid/squid.conf
+      changed_when: false
+
+    - name: Verify Squid is listening on proxy port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ proxy_listen_port }}"
+        timeout: 30
+
+    - name: Verify Squid MITM presents the lab root CA
+      ansible.builtin.command: >
+        curl -sS -x http://127.0.0.1:{{ proxy_listen_port }} -vk https://example.com/
+      register: mitm_probe
+      changed_when: false
+      failed_when: >
+        pki_root_ca_common_name not in mitm_probe.stderr and
+        'Mirror Operator' not in mitm_probe.stderr
+
+    - name: Display Squid MITM summary
+      ansible.builtin.debug:
+        msg:
+          - "Squid SSL bump enabled on {{ inventory_hostname }}"
+          - "MITM probe issuer contains: {{ pki_root_ca_common_name }}"
+          - "Cluster nodes should already trust the lab root CA via spec.trustedCA before MITM is active"
+
+  handlers:
+    - name: Restart Squid
+      ansible.builtin.systemd:
+        name: squid
+        state: restarted

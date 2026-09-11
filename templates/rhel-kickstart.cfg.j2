@@ -120,4 +120,23 @@ SYSEOF
 
 # Ensure graphical target
 systemctl set-default graphical.target
+
+{% if proxy_enabled | default(false) | bool %}
+# Trust Mirror Operator root CA (required for HTTPS through MITM proxy)
+cat > /etc/pki/ca-trust/source/anchors/mirror-operator-root-ca.crt <<'CAEOF'
+{{ root_ca_pem | default('') }}
+CAEOF
+update-ca-trust extract
+
+# Configure corporate proxy for isolated network workloads
+mkdir -p /etc/environment.d
+cat > /etc/environment.d/proxy.conf <<PROXYEOF
+HTTP_PROXY=http://{{ proxy_hostname }}:{{ proxy_listen_port }}
+HTTPS_PROXY=http://{{ proxy_hostname }}:{{ proxy_listen_port }}
+http_proxy=http://{{ proxy_hostname }}:{{ proxy_listen_port }}
+https_proxy=http://{{ proxy_hostname }}:{{ proxy_listen_port }}
+NO_PROXY={{ proxy_no_proxy }}
+no_proxy={{ proxy_no_proxy }}
+PROXYEOF
+{% endif %}
 %end
