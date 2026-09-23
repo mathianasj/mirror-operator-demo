@@ -49,6 +49,11 @@
     - ../group_vars/all.yml
 
   tasks:
+    # setup-proxy.yml sets this false when ocp_configure_cluster_proxy is true; override for this play.
+    - name: Enable Squid SSL bump on hypervisor
+      ansible.builtin.set_fact:
+        proxy_ssl_bump_enabled: true
+
     - name: Create Squid spool directory
       ansible.builtin.file:
         path: /var/spool/squid
@@ -66,17 +71,26 @@
         dest: /etc/squid/squid.conf
         mode: "0644"
         validate: "squid -k parse -f %s"
-      vars:
-        proxy_ssl_bump_enabled: true
       notify: Restart Squid
 
     - name: Apply Squid configuration before health check
       ansible.builtin.meta: flush_handlers
 
-    - name: Verify deployed Squid configuration enables SSL bump
-      ansible.builtin.command:
-        cmd: grep -Eq 'http_port .* ssl-bump|ssl_bump' /etc/squid/squid.conf
+    - name: Read deployed Squid configuration
+      ansible.builtin.slurp:
+        src: /etc/squid/squid.conf
+      register: squid_conf_deployed
       changed_when: false
+
+    - name: Verify deployed Squid configuration enables SSL bump
+      ansible.builtin.assert:
+        that:
+          - "'ssl-bump' in (squid_conf_deployed.content | b64decode)"
+          - "'ssl_bump' in (squid_conf_deployed.content | b64decode)"
+        fail_msg: >-
+          /etc/squid/squid.conf is still in forward-proxy mode (no ssl-bump).
+          proxy_ssl_bump_enabled={{ proxy_ssl_bump_enabled | default('unset') }}.
+          Re-run enable-proxy-mitm.yml or check the template render on the hypervisor.
 
     - name: Verify Squid is listening on proxy port
       ansible.builtin.wait_for:

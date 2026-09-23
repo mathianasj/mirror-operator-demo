@@ -120,8 +120,14 @@ cert_manager_intermediate_secret_name: mirror-operator-intermediate-ca
 ocp_configure_cluster_proxy: true  # set false to skip cluster Proxy configuration
 ocp_cluster_proxy_url: ""  # default: read from certs/cluster-proxy-url exported by setup-proxy.yml
 ocp_cluster_no_proxy_extra: ""  # appended to auto-detected cluster noProxy list
+# Auto-append cluster apps/api/machine entries so internal routes bypass the MITM proxy
+ocp_cluster_no_proxy_auto_detect: true
 ocp_cluster_trust_bundle_configmap_name: user-ca-bundle
 ocp_cluster_trust_bundle_namespace: openshift-config
+# Merged into openshift-config/user-ca-bundle (spec.proxy.trustedCA) for node + workload trust
+ocp_cluster_trust_include_intermediate_ca: true  # cert-manager ClusterIssuer signing CA
+ocp_cluster_trust_include_ingress_ca: true  # router-ca — verifies default *.apps route certs (e.g. Keycloak)
+ocp_cluster_trust_merge_existing_user_ca_bundle: true  # preserve PEMs already in user-ca-bundle
 ocp_cluster_proxy_mcp_wait_retries: 60
 ocp_cluster_proxy_mcp_wait_delay: 20
 

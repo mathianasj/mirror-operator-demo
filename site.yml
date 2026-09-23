@@ -26,8 +26,5 @@
 - name: Set up Redfish simulation
   ansible.builtin.import_playbook: playbooks/setup-redfish.yml
 
-- name: Configure OpenShift cluster-wide proxy and root CA trust
-  ansible.builtin.import_playbook: playbooks/openshift/configure-cluster-proxy.yml
-
-- name: Configure cert-manager ClusterIssuer with lab intermediate CA
-  ansible.builtin.import_playbook: playbooks/openshift/configure-cert-manager-issuer.yml
+- name: OpenShift post-install
+  ansible.builtin.import_playbook: playbooks/openshift/site.yml

@@ -6,26 +6,148 @@
     - ../group_vars/all.yml
 
   tasks:
-    - name: Check if RHEL ISO already exists
+    - name: Ensure ISO storage directory exists
+      ansible.builtin.file:
+        path: "{{ iso_storage_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Check if RHEL ISO file is present
       ansible.builtin.stat:
         path: "{{ iso_storage_path }}/{{ rhel_iso_filename }}"
-      register: rhel_iso
+      register: rhel_iso_stat
+
+    - name: Inspect RHEL ISO file type when present
+      ansible.builtin.command:
+        cmd: file -b {{ iso_storage_path }}/{{ rhel_iso_filename }}
+      register: rhel_iso_file_type
+      changed_when: false
+      failed_when: false
+      when: rhel_iso_stat.stat.exists
+
+    - name: Determine whether local RHEL ISO is usable
+      ansible.builtin.set_fact:
+        rhel_iso_valid: >-
+          {{
+            rhel_iso_stat.stat.exists
+            and (rhel_iso_stat.stat.size | int) >= 5000000000
+            and ('ISO 9660' in (rhel_iso_file_type.stdout | default('')))
+          }}
+
+    - name: Require rhel_iso_url when ISO is missing or invalid
+      ansible.builtin.assert:
+        that:
+          - rhel_iso_url | default('') | length > 0
+        fail_msg: >-
+          {{ iso_storage_path }}/{{ rhel_iso_filename }} is missing or not a valid RHEL 9 DVD
+          (expected ≥5 GiB ISO 9660). On the hypervisor, inspect with:
+          file {{ iso_storage_path }}/{{ rhel_iso_filename }}; ls -lh {{ iso_storage_path }}/{{ rhel_iso_filename }}
+          Remove a bad file (sudo rm -f ...), copy a fresh DVD download URL from the Red Hat Customer
+          Portal, and re-run with -e rhel_iso_url=... (CDN links expire).
+      when: not rhel_iso_valid | bool
 
     - name: Download RHEL 9 DVD ISO
-      ansible.builtin.command:
-        cmd: curl -L -o {{ iso_storage_path }}/{{ rhel_iso_filename }} {{ rhel_iso_url }}
-      when: not rhel_iso.stat.exists
+      ansible.builtin.get_url:
+        url: "{{ rhel_iso_url }}"
+        dest: "{{ iso_storage_path }}/{{ rhel_iso_filename }}"
+        mode: "0644"
+        force: true
+        timeout: 7200
+      when: not rhel_iso_valid | bool
 
-    - name: Verify ISO is valid (check minimum size)
+    - name: Re-check RHEL ISO after download
       ansible.builtin.stat:
         path: "{{ iso_storage_path }}/{{ rhel_iso_filename }}"
-      register: iso_stat
+      register: rhel_iso_stat
+      when: not rhel_iso_valid | bool
 
-    - name: Re-download ISO if corrupted (too small for DVD)
-      ansible.builtin.shell: |
-        rm -f {{ iso_storage_path }}/{{ rhel_iso_filename }}
-        curl -L -o {{ iso_storage_path }}/{{ rhel_iso_filename }} {{ rhel_iso_url }}
-      when: iso_stat.stat.size < 5000000000
+    - name: Re-inspect RHEL ISO file type after download
+      ansible.builtin.command:
+        cmd: file -b {{ iso_storage_path }}/{{ rhel_iso_filename }}
+      register: rhel_iso_file_type
+      changed_when: false
+      when: not rhel_iso_valid | bool
+
+    - name: Fail when downloaded file is not a RHEL DVD ISO
+      ansible.builtin.fail:
+        msg: >-
+          Downloaded {{ iso_storage_path }}/{{ rhel_iso_filename }} is not a valid DVD image
+          (size={{ rhel_iso_stat.stat.size | default(0) }},
+          type={{ rhel_iso_file_type.stdout | default('unknown') | trim }}).
+          Red Hat CDN URLs expire; open the Customer Portal, start a new RHEL 9.8 DVD download,
+          copy the fresh link immediately, sudo rm -f the bad file on the hypervisor, and re-run with
+          -e rhel_iso_url=<new-url>.
+      when:
+        - not rhel_iso_valid | bool
+        - not (
+            rhel_iso_stat.stat.exists
+            and (rhel_iso_stat.stat.size | int) >= 5000000000
+            and ('ISO 9660' in (rhel_iso_file_type.stdout | default('')))
+          )
+
+    - name: Validate RHEL ISO layout (loop mount; no extra packages)
+      vars:
+        rhel_iso_validate_mount: /mnt/rhel-iso-validate
+        rhel_iso_path: "{{ iso_storage_path }}/{{ rhel_iso_filename }}"
+      block:
+        - name: Ensure RHEL ISO validation mount point exists
+          ansible.builtin.file:
+            path: "{{ rhel_iso_validate_mount }}"
+            state: directory
+            mode: "0755"
+
+        - name: Mount RHEL ISO read-only for validation
+          ansible.builtin.shell: |
+            set -euo pipefail
+            mount -o ro,loop "{{ rhel_iso_path }}" "{{ rhel_iso_validate_mount }}"
+          changed_when: false
+          register: rhel_iso_mount
+          failed_when: false
+
+        - name: Fail when ISO cannot be mounted (file is not a real DVD image)
+          ansible.builtin.fail:
+            msg: >-
+              Could not loop-mount {{ rhel_iso_path }} (mount exit {{ rhel_iso_mount.rc }}).
+              The file is not a valid ISO 9660 image — usually a failed download or HTML error page.
+              On the hypervisor: file {{ rhel_iso_path }}; head -c 200 {{ rhel_iso_path }}
+              Then sudo rm -f {{ rhel_iso_path }} and re-run with a fresh -e rhel_iso_url= from the portal.
+          when: rhel_iso_mount.rc != 0
+
+        - name: Check installer kernel exists in mounted ISO
+          ansible.builtin.stat:
+            path: "{{ rhel_iso_validate_mount }}/images/pxeboot/vmlinuz"
+          register: rhel_iso_vmlinuz
+
+        - name: Fail when RHEL ISO is not a bootable full DVD
+          ansible.builtin.fail:
+            msg: >-
+              {{ rhel_iso_path }} does not look like a RHEL 9 DVD
+              (missing images/pxeboot/vmlinuz). Re-download the full DVD from Red Hat
+              (ansible -e rhel_iso_url=...) and remove the bad file on the hypervisor.
+          when: not rhel_iso_vmlinuz.stat.exists
+
+      always:
+        - name: Unmount RHEL ISO after validation
+          ansible.builtin.shell: |
+            set -euo pipefail
+            if mountpoint -q "{{ rhel_iso_validate_mount }}"; then
+              umount "{{ rhel_iso_validate_mount }}"
+            fi
+          changed_when: false
+          failed_when: false
+
+    - name: Read RHEL ISO volume label for inst.stage2
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -p
+          - -o
+          - value
+          - -s
+          - LABEL
+          - "{{ iso_storage_path }}/{{ rhel_iso_filename }}"
+      register: rhel_iso_volume_id
+      changed_when: false
 
     - name: Read root CA certificate for kickstart
       ansible.builtin.slurp:
@@ -47,6 +169,43 @@
       failed_when: false
       changed_when: false
 
+    - name: Check existing VM disk allocation
+      ansible.builtin.shell: virsh domblkinfo {{ rhel_vm_name }} vda | awk '/Allocation/{print $2}'
+      register: existing_disk_info
+      changed_when: false
+      failed_when: false
+      when: vm_exists.rc == 0
+
+    - name: Remove incomplete VM domain from a failed install
+      when:
+        - vm_exists.rc == 0
+        - (existing_disk_info.stdout | default('0') | trim | int) < 2000000000
+      block:
+        - name: Destroy incomplete VM
+          community.libvirt.virt:
+            name: "{{ rhel_vm_name }}"
+            state: destroyed
+          failed_when: false
+
+        - name: Undefine incomplete VM and storage
+          ansible.builtin.command:
+            cmd: virsh undefine {{ rhel_vm_name }} --remove-all-storage
+          changed_when: true
+
+    - name: Determine if RHEL VM installation is required
+      ansible.builtin.set_fact:
+        rhel_vm_needs_install: >-
+          {{
+            vm_exists.rc != 0
+            or (
+              (
+                (existing_disk_info.stdout | default('0') | trim)
+                if (vm_exists.rc == 0 and (existing_disk_info is defined))
+                else '0'
+              ) | int
+            ) < 2000000000
+          }}
+
     - name: Create RHEL 9 VM with virt-install
       ansible.builtin.command: >
         virt-install
@@ -55,19 +214,19 @@
         --memory {{ rhel_vm_memory_mb }}
         --disk size={{ rhel_vm_disk_size_gb }},pool={{ storage_pool_name }},format=qcow2,bus=virtio
         --network network=default,model=virtio
-        --location {{ iso_storage_path }}/{{ rhel_iso_filename }},kernel=images/pxeboot/vmlinuz,initrd=images/pxeboot/initrd.img
+        --location {{ iso_storage_path }}/{{ rhel_iso_filename }}
         --initrd-inject /tmp/rhel-kickstart.cfg
-        --extra-args "inst.ks=file:/rhel-kickstart.cfg inst.stage2=cdrom console=ttyS0"
+        --extra-args "inst.ks=file:/rhel-kickstart.cfg inst.stage2=hd:LABEL={{ rhel_iso_volume_id.stdout | trim }} console=ttyS0"
         --os-variant rhel9-unknown
         --boot uefi
         --graphics vnc,listen=0.0.0.0
         --noautoconsole
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Wait 2 minutes for installer to start
       ansible.builtin.pause:
         seconds: 120
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Wait for RHEL installation to complete (VM shuts off when done)
       community.libvirt.virt:
@@ -77,18 +236,18 @@
       until: vm_status.status == "shutdown" or vm_status.status == "shutoff"
       retries: 120
       delay: 60
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Verify installation wrote to disk
       ansible.builtin.shell: virsh domblkinfo {{ rhel_vm_name }} vda | awk '/Allocation/{print $2}'
       register: disk_info
       changed_when: false
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Fail if installation did not complete (disk still empty)
       ansible.builtin.fail:
         msg: "RHEL installation failed — disk allocation is only {{ disk_info.stdout | trim }} bytes."
-      when: vm_exists.rc != 0 and (disk_info.stdout | trim | int) < 2000000000
+      when: rhel_vm_needs_install | bool and (disk_info.stdout | trim | int) < 2000000000
 
     # --- Switch to isolated network after install ---
 
@@ -97,7 +256,7 @@
         name: "{{ rhel_vm_name }}"
         state: shutdown
       failed_when: false
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Wait for VM to fully shut down
       ansible.builtin.command: virsh domstate {{ rhel_vm_name }}
@@ -106,23 +265,23 @@
       retries: 30
       delay: 10
       changed_when: false
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Detach NAT network interface
       ansible.builtin.command: >
         virsh detach-interface {{ rhel_vm_name }} network --config
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Attach isolated network interface
       ansible.builtin.command: >
         virsh attach-interface {{ rhel_vm_name }} network {{ isolated_network_name }} --model virtio --config
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Start VM on isolated network
       community.libvirt.virt:
         name: "{{ rhel_vm_name }}"
         state: running
-      when: vm_exists.rc != 0
+      when: rhel_vm_needs_install | bool
 
     - name: Clean up kickstart file
       ansible.builtin.file:

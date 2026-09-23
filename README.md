@@ -2,7 +2,7 @@
 
 Ansible automation for a KVM hypervisor lab on AWS bare metal. The top-level playbook provisions an EC2 host, configures KVM/GNOME/VNC, creates an isolated libvirt network, and deploys a RHEL 9 mirror workstation plus demo VMs with Redfish simulation.
 
-A separate OpenShift playbook stack (`playbooks/openshift/site.yml`) handles post-install ODF/NooBaa configuration and is not invoked by the root `site.yml`.
+After the hypervisor lab, root [`site.yml`](site.yml) imports [`playbooks/openshift/site.yml`](playbooks/openshift/site.yml) as a single sub-playbook (same file you can run alone for cluster-only work).
 
 ## Quick start
 
@@ -22,19 +22,30 @@ Ansible reads [`ansible.cfg`](ansible.cfg): inventory [`inventory/hosts.yml`](in
 
 ## Playbook flow
 
-[`site.yml`](site.yml) imports eleven child playbooks in order:
+[`site.yml`](site.yml) runs the hypervisor lab, then the OpenShift stack:
+
+**Hypervisor lab**
 
 1. [`playbooks/provision-ec2.yml`](playbooks/provision-ec2.yml) — launch bare-metal EC2 instance
 2. [`playbooks/configure-host.yml`](playbooks/configure-host.yml) — KVM, GNOME, VNC, Cockpit, NTP, DNS
-3. [`playbooks/setup-proxy.yml`](playbooks/setup-proxy.yml) — corporate MITM proxy (Squid SSL bump) and PKI
+3. [`playbooks/setup-proxy.yml`](playbooks/setup-proxy.yml) — corporate MITM proxy (forward mode first) and PKI
 4. [`playbooks/create-networks.yml`](playbooks/create-networks.yml) — default NAT + isolated libvirt network
 5. [`playbooks/create-storage.yml`](playbooks/create-storage.yml) — libvirt storage pool and ISO directory
 6. [`playbooks/create-fedora-vm.yml`](playbooks/create-fedora-vm.yml) — RHEL 9 mirror workstation (FIPS + DISA STIG)
 7. [`playbooks/create-bare-vm.yml`](playbooks/create-bare-vm.yml) — bare VM with extra disk
 8. [`playbooks/create-sno-vm.yml`](playbooks/create-sno-vm.yml) — SNO demo VM
 9. [`playbooks/setup-redfish.yml`](playbooks/setup-redfish.yml) — sushy Redfish emulator
-10. [`playbooks/openshift/configure-cluster-proxy.yml`](playbooks/openshift/configure-cluster-proxy.yml) — cluster trust bundle + proxy URLs, then [`enable-proxy-mitm.yml`](playbooks/enable-proxy-mitm.yml) (enabled by default)
-11. [`playbooks/openshift/configure-cert-manager-issuer.yml`](playbooks/openshift/configure-cert-manager-issuer.yml) — cert-manager ClusterIssuer (enabled by default)
+
+**OpenShift** (via [`playbooks/openshift/site.yml`](playbooks/openshift/site.yml))
+
+10. [`connect-cluster.yml`](playbooks/openshift/connect-cluster.yml) — kubeconfig, version/channel facts
+11. [`configure-cluster-proxy.yml`](playbooks/openshift/configure-cluster-proxy.yml) — trust bundle + proxy URLs, then [`enable-proxy-mitm.yml`](playbooks/enable-proxy-mitm.yml)
+12. [`configure-cert-manager-issuer.yml`](playbooks/openshift/configure-cert-manager-issuer.yml) — ClusterIssuer
+13. [`scale-worker-machineset.yml`](playbooks/openshift/scale-worker-machineset.yml) — worker MachineSet replicas
+14. [`create-gp3-high-perf-sc.yml`](playbooks/openshift/create-gp3-high-perf-sc.yml) — high-performance `StorageClass`
+15. [`install-odf-noobaa.yml`](playbooks/openshift/install-odf-noobaa.yml) — ODF / NooBaa operator install
+16. [`configure-noobaa-backing-store.yml`](playbooks/openshift/configure-noobaa-backing-store.yml) — NooBaa backing store
+17. [`validate-odf-noobaa.yml`](playbooks/openshift/validate-odf-noobaa.yml) — health checks
 
 All configuration flows from [`group_vars/all.yml`](group_vars/all.yml), inventory, CLI extra-vars (`-e`), and external prerequisites. There is no playbook-level `vars:` block in `site.yml`.
 
@@ -88,7 +99,9 @@ All child playbooks load [`group_vars/all.yml`](group_vars/all.yml) via `vars_fi
 | `ec2_security_group_name` | `mirror-operator-sg` | Opens SSH 22, VNC 5901, Cockpit 9090, proxy 3128 |
 | `ec2_vpc_domain_pattern` | `*.opentlc.com` | VPC discovery tag filter |
 
-**Runtime-derived (not user inputs):** `ec2_ami`, `ec2_ami_name` (latest RHEL 9 Hourly GP3 AMI), `ec2_vpc_id`, `ec2_subnet_id`, `ec2_instance_names`.
+Launch tries **one public subnet per availability zone** in sorted AZ order. If AWS returns `InsufficientInstanceCapacity`, the playbook automatically retries the next AZ with a public subnet in the same VPC.
+
+**Runtime-derived (not user inputs):** `ec2_ami`, `ec2_ami_name` (latest RHEL 9 Hourly GP3 AMI), `ec2_vpc_id`, `ec2_subnet_id`, `ec2_launch_availability_zone`, `ec2_instance_names`.
 
 ### Host configuration (`configure-host.yml`)
 
@@ -214,8 +227,16 @@ Simulates a corporate HTTP/HTTPS proxy with Squid SSL bump (MITM). Generates a t
 When `ocp_configure_cluster_proxy` is true (default), the playbooks enforce this safe order:
 
 1. **`setup-proxy.yml`** — PKI + Squid in **forward-proxy mode** (MITM deferred)
-2. **`configure-cluster-proxy.yml`** — apply root CA ConfigMap + `spec.trustedCA.name`, wait for worker MCP rollout, then set proxy URLs
+2. **`configure-cluster-proxy.yml`** — merge lab + ingress CAs into `openshift-config/user-ca-bundle`, wire `spec.trustedCA.name`, wait for MCP rollout, then set proxy URLs
 3. **`enable-proxy-mitm.yml`** — re-enable Squid SSL bump only after nodes trust the lab root CA
+
+The cluster `user-ca-bundle` ConfigMap (not the OLM `cluster-ca-bundle` alone) is what `spec.proxy.trustedCA` rolls out to nodes. By default the playbook merges:
+
+- **Mirror Operator root CA** (MITM / Quay-style trust)
+- **Intermediate CA** exported for cert-manager (`intermediate-ca.crt`)
+- **Ingress router CA** (`openshift-ingress-operator/router-ca`) so workloads trust default `*.apps` route certificates (e.g. Keycloak)
+
+Operator subscriptions that mount only `cluster-ca-bundle` for `SSL_CERT_FILE` may still need a separate mount for the ingress CA; node-wide trust comes from `user-ca-bundle` after MCP rollout.
 
 Set `-e ocp_configure_cluster_proxy=false` to skip cluster Proxy configuration entirely.
 
@@ -226,24 +247,21 @@ The cluster proxy playbook refuses to run if:
 - `spec.trustedCA.name` is not wired to the ConfigMap after phase 1
 - The hypervisor proxy is unreachable from the Ansible controller
 
+When `ocp_cluster_no_proxy_auto_detect` is true (default), the playbook also adds cluster-local bypass entries such as `.<baseDomain>`, `.<apps-domain>`, the internal API hostname, node `/16` CIDRs, `169.254.169.254`, and `.<region>.compute.internal` on AWS — so internal routes like Quay `.apps.*` do not hairpin through the MITM proxy.
+
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `ocp_configure_cluster_proxy` | `true` | Set `false` to skip cluster Proxy configuration |
 | `proxy_ssl_bump_enabled` | auto | set `false` in `setup-proxy.yml` when cluster proxy is enabled; forced `true` in `enable-proxy-mitm.yml` |
 | `ocp_cluster_proxy_url` | `""` | Override auto-detected URL from `certs/cluster-proxy-url` |
 | `ocp_cluster_no_proxy_extra` | `""` | Extra hosts/CIDRs appended to cluster `noProxy` |
+| `ocp_cluster_no_proxy_auto_detect` | `true` | Append cluster base domain, ingress domain, internal API, node /16 CIDRs, and cloud metadata to `noProxy` |
 
 **Automated ClusterIssuer configuration** (enabled by default):
 
-Step 11 in [`site.yml`](site.yml) applies the intermediate CA to cert-manager. Requires cert-manager Operator installed on the cluster and a valid kubeconfig:
+Step 12 in [`site.yml`](site.yml) applies the intermediate CA to cert-manager. Requires cert-manager Operator installed on the cluster and a valid kubeconfig (`KUBECONFIG` or `~/.kube/config`).
 
-```bash
-ansible-playbook site.yml \
-  -e vnc_password="..." \
-  ...
-```
-
-Or via the OpenShift stack (runs after `connect-cluster.yml`):
+To refresh **only** the OpenShift steps (after the hypervisor lab and `certs/` export already exist):
 
 ```bash
 ansible-playbook playbooks/openshift/site.yml
@@ -298,16 +316,6 @@ The RHEL mirror workstation kickstart trusts the root CA and sets proxy environm
 
 - `ec2_ami`, `ec2_vpc_id`, `ec2_subnet_id`, `sno_vm_uuid`, dynamically added hypervisor IPs
 
-## Variables not used by `site.yml`
+OpenShift/ODF tuning (`ocp_kubeconfig`, `gp3_high_perf_*`, `odf_*`, `noobaa_*`, MachineSet replicas) lives in [`group_vars/all.yml`](group_vars/all.yml) and is used by steps 10–17 above.
 
-[`group_vars/all.yml`](group_vars/all.yml) also defines OpenShift/ODF variables (`ocp_kubeconfig`, `gp3_high_perf_*`, `odf_*`, `noobaa_*`). These are consumed only by [`playbooks/openshift/site.yml`](playbooks/openshift/site.yml) and are not inputs to the hypervisor lab playbook.
-
-## OpenShift stack (separate)
-
-To configure OpenShift post-install (cluster proxy/CA trust, ClusterIssuer, worker scaling, gp3-high-perf StorageClass, standalone NooBaa/ODF):
-
-```bash
-ansible-playbook playbooks/openshift/site.yml
-```
-
-Requires `oc` CLI, a valid kubeconfig (`KUBECONFIG` or `~/.kube/config`), and cert-manager Operator for step 11. Cluster proxy (step 10) is on by default — set `-e ocp_configure_cluster_proxy=false` to skip. Set `-e cert_manager_configure_issuer=false` to skip the ClusterIssuer step. PKI artifacts must exist in `certs/` (exported by `setup-proxy.yml` during the hypervisor run). See `group_vars/all.yml` for OpenShift/ODF variable defaults.
+**Prerequisites for OpenShift steps:** `oc` CLI, reachable cluster API, PKI under `certs/` from `setup-proxy.yml`, and cert-manager Operator for the ClusterIssuer step. Use `-e ocp_configure_cluster_proxy=false` or `-e cert_manager_configure_issuer=false` to skip individual playbooks inside the stack.

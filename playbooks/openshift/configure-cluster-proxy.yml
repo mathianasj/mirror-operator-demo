@@ -110,6 +110,86 @@
         validate_certs: "{{ ocp_verify_ssl }}"
       register: cluster_network_info
 
+    - name: Get cluster DNS configuration
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: DNS
+        name: cluster
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: cluster_dns_info
+      when: ocp_cluster_no_proxy_auto_detect | bool
+
+    - name: Get cluster ingress configuration
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Ingress
+        name: cluster
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: cluster_ingress_info
+      when: ocp_cluster_no_proxy_auto_detect | bool
+
+    - name: Get cluster infrastructure configuration
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Infrastructure
+        name: cluster
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: cluster_infrastructure_info
+      when: ocp_cluster_no_proxy_auto_detect | bool
+
+    - name: Detect machine network CIDRs from node InternalIP addresses
+      ansible.builtin.shell: |
+        set -euo pipefail
+        oc get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+          | awk -F. 'NF==4 {print $1"."$2".0.0/16"}' \
+          | sort -u \
+          | paste -sd, -
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: node_machine_cidrs
+      changed_when: false
+      failed_when: false
+      when: ocp_cluster_no_proxy_auto_detect | bool
+
+    - name: Build auto-detected cluster noProxy suffixes
+      ansible.builtin.set_fact:
+        ocp_auto_no_proxy_suffixes: >-
+          {{
+            [
+              ('.' ~ cluster_dns_info.resources[0].spec.baseDomain)
+              if (
+                ocp_cluster_no_proxy_auto_detect | bool and
+                cluster_dns_info.resources | default([]) | length > 0 and
+                cluster_dns_info.resources[0].spec.baseDomain | default('') | length > 0
+              ) else '',
+              ('.' ~ cluster_ingress_info.resources[0].spec.domain)
+              if (
+                ocp_cluster_no_proxy_auto_detect | bool and
+                cluster_ingress_info.resources | default([]) | length > 0 and
+                cluster_ingress_info.resources[0].spec.domain | default('') | length > 0
+              ) else '',
+              (cluster_infrastructure_info.resources[0].status.apiServerInternalURI | urlsplit('hostname'))
+              if (
+                ocp_cluster_no_proxy_auto_detect | bool and
+                cluster_infrastructure_info.resources | default([]) | length > 0 and
+                cluster_infrastructure_info.resources[0].status.apiServerInternalURI | default('') | length > 0
+              ) else '',
+              ('.' ~ cluster_infrastructure_info.resources[0].status.platformStatus.aws.region ~ '.compute.internal')
+              if (
+                ocp_cluster_no_proxy_auto_detect | bool and
+                cluster_infrastructure_info.resources | default([]) | length > 0 and
+                cluster_infrastructure_info.resources[0].status.platformStatus.type | default('') == 'AWS' and
+                cluster_infrastructure_info.resources[0].status.platformStatus.aws.region | default('') | length > 0
+              ) else '',
+              node_machine_cidrs.stdout | default(''),
+              '169.254.169.254'
+              if ocp_cluster_no_proxy_auto_detect | bool else ''
+            ]
+          }}
+
     - name: Build cluster noProxy list
       ansible.builtin.set_fact:
         ocp_effective_cluster_no_proxy: >-
@@ -120,11 +200,14 @@
               '.cluster.local',
               cluster_network_info.resources[0].status.serviceNetwork | default([]) | join(','),
               cluster_network_info.resources[0].status.clusterNetwork | default([]) | map(attribute='cidr') | list | join(','),
+              ocp_auto_no_proxy_suffixes | default([]),
               ocp_cluster_no_proxy_extra | default('')
             ]
+            | flatten
             | map('string')
             | map('trim')
             | reject('equalto', '')
+            | unique
             | join(',')
             | regex_replace(',+', ',')
             | regex_replace('^,|,$', '')
@@ -133,7 +216,24 @@
 
     - name: Fall back to static noProxy list
       ansible.builtin.set_fact:
-        ocp_effective_cluster_no_proxy: "{{ proxy_no_proxy }},.svc,.cluster.local{{ ',' ~ ocp_cluster_no_proxy_extra if (ocp_cluster_no_proxy_extra | default('') | length > 0) else '' }}"
+        ocp_effective_cluster_no_proxy: >-
+          {{
+            [
+              proxy_no_proxy,
+              '.svc',
+              '.cluster.local',
+              ocp_auto_no_proxy_suffixes | default([]),
+              ocp_cluster_no_proxy_extra | default('')
+            ]
+            | flatten
+            | map('string')
+            | map('trim')
+            | reject('equalto', '')
+            | unique
+            | join(',')
+            | regex_replace(',+', ',')
+            | regex_replace('^,|,$', '')
+          }}
       when: cluster_network_info.resources | length == 0
 
     - name: Read root CA PEM for cluster trust bundle
@@ -144,6 +244,133 @@
       ansible.builtin.fail:
         msg: "Root CA at {{ pki_local_export_path }}/root-ca.crt is empty or unreadable."
       when: ocp_root_ca_pem | length == 0
+
+    - name: Check exported intermediate CA exists
+      ansible.builtin.stat:
+        path: "{{ pki_local_export_path }}/intermediate-ca.crt"
+      register: intermediate_ca_export_stat
+
+    - name: Read intermediate CA PEM (cert-manager issuer)
+      ansible.builtin.set_fact:
+        ocp_intermediate_ca_pem: "{{ lookup('file', pki_local_export_path ~ '/intermediate-ca.crt') }}"
+      when:
+        - ocp_cluster_trust_include_intermediate_ca | bool
+        - intermediate_ca_export_stat.stat.exists
+
+    - name: Warn when intermediate CA export is missing
+      ansible.builtin.debug:
+        msg: >-
+          intermediate-ca.crt not found under {{ pki_local_export_path }}; trust bundle will omit
+          the cert-manager issuer CA (re-run setup-proxy.yml to export PKI).
+      when:
+        - ocp_cluster_trust_include_intermediate_ca | bool
+        - not intermediate_ca_export_stat.stat.exists
+
+    - name: Get OpenShift ingress router CA secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: router-ca
+        namespace: openshift-ingress-operator
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: router_ca_secret
+      when: ocp_cluster_trust_include_ingress_ca | bool
+
+    - name: Decode ingress router CA PEM
+      ansible.builtin.set_fact:
+        ocp_ingress_ca_pem: "{{ router_ca_secret.resources[0].data['tls.crt'] | b64decode }}"
+      when:
+        - ocp_cluster_trust_include_ingress_ca | bool
+        - router_ca_secret.resources | default([]) | length > 0
+        - router_ca_secret.resources[0].data.get('tls.crt') is not none
+
+    - name: Fail when ingress router CA is required but missing
+      ansible.builtin.fail:
+        msg: >-
+          Secret openshift-ingress-operator/router-ca not found or tls.crt is empty; cannot add the
+          ingress CA to {{ ocp_cluster_trust_bundle_configmap_name }} (needed for *.apps route TLS).
+          Set ocp_cluster_trust_include_ingress_ca=false to skip.
+      when:
+        - ocp_cluster_trust_include_ingress_ca | bool
+        - ocp_ingress_ca_pem | default('') | trim | length == 0
+
+    - name: Read existing cluster user-ca-bundle ConfigMap
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ ocp_cluster_trust_bundle_configmap_name }}"
+        namespace: "{{ ocp_cluster_trust_bundle_namespace }}"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: existing_user_ca_cm
+      when: ocp_cluster_trust_merge_existing_user_ca_bundle | bool
+
+    - name: Capture existing user-ca-bundle PEM
+      ansible.builtin.set_fact:
+        ocp_existing_user_ca_bundle_pem: >-
+          {{
+            existing_user_ca_cm.resources[0].data.get('ca-bundle.crt', '')
+            if (
+              ocp_cluster_trust_merge_existing_user_ca_bundle | bool
+              and (existing_user_ca_cm.resources | default([]) | length > 0)
+            )
+            else ''
+          }}
+
+    - name: Stage PEM inputs for trust bundle normalization
+      ansible.builtin.copy:
+        dest: "{{ pki_local_export_path }}/.trust-bundle-input.pem"
+        mode: "0600"
+        content: |
+          {{ [
+            ocp_existing_user_ca_bundle_pem | default(''),
+            ocp_root_ca_pem,
+            ocp_intermediate_ca_pem | default(''),
+            ocp_ingress_ca_pem | default('')
+          ] | map('regex_replace', '^\s+|\s+$', '') | reject('equalto', '') | join('\n\n') }}
+
+    - name: Normalize and deduplicate cluster trust bundle PEM
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 "{{ playbook_dir }}/files/normalize_pem_bundle.py" \
+          < "{{ pki_local_export_path }}/.trust-bundle-input.pem" \
+          > "{{ pki_local_export_path }}/.trust-bundle-normalized.pem"
+      register: normalize_trust_bundle_cmd
+      changed_when: false
+      failed_when: normalize_trust_bundle_cmd.rc != 0
+
+    - name: Stat normalized trust bundle output
+      ansible.builtin.stat:
+        path: "{{ pki_local_export_path }}/.trust-bundle-normalized.pem"
+      register: normalized_trust_bundle_stat
+
+    - name: Fail when normalized trust bundle file is missing or empty
+      ansible.builtin.fail:
+        msg: >-
+          normalize_pem_bundle.py did not produce {{ pki_local_export_path }}/.trust-bundle-normalized.pem.
+      when: not normalized_trust_bundle_stat.stat.exists or normalized_trust_bundle_stat.stat.size | int < 128
+
+    - name: Reject trust bundles with literal backslash-n (breaks OpenShift parsers)
+      ansible.builtin.command:
+        cmd: >-
+          python3 -c "import pathlib,sys;
+          data=pathlib.Path(sys.argv[1]).read_text();
+          sys.exit(1 if chr(92)+'n' in data else 0)"
+          {{ pki_local_export_path }}/.trust-bundle-normalized.pem
+      changed_when: false
+
+    - name: Validate normalized trust bundle with openssl
+      ansible.builtin.command:
+        cmd: >-
+          openssl crl2pkcs7 -nocrl
+          -certfile {{ pki_local_export_path }}/.trust-bundle-normalized.pem
+          -out /dev/null
+      changed_when: false
+
+    - name: Load normalized cluster trust bundle PEM for ConfigMap render
+      ansible.builtin.set_fact:
+        ocp_cluster_trust_bundle_pem: "{{ lookup('file', pki_local_export_path ~ '/.trust-bundle-normalized.pem') }}"
 
     - name: Render root CA ConfigMap for cluster trust bundle (phase 1)
       ansible.builtin.template:
@@ -192,6 +419,14 @@
       register: trust_bundle_cm_apply
       changed_when: "'configured' in trust_bundle_cm_apply.stdout or 'created' in trust_bundle_cm_apply.stdout"
 
+    - name: Record whether trust bundle ConfigMap apply reported a change
+      ansible.builtin.set_fact:
+        ocp_trust_bundle_cm_applied: >-
+          {{
+            'configured' in trust_bundle_cm_apply.stdout
+            or 'created' in trust_bundle_cm_apply.stdout
+          }}
+
     - name: "Phase 1b — reference trust bundle ConfigMap from cluster Proxy"
       ansible.builtin.command:
         cmd: >-
@@ -236,6 +471,23 @@
           oc get proxy cluster -o yaml
       when: proxy_trusted_ca_name.stdout != ocp_cluster_trust_bundle_configmap_name
 
+    - name: Wait for worker MCP to start trust bundle rollout (optional)
+      ansible.builtin.command:
+        cmd: >-
+          oc get machineconfigpool worker
+          -o jsonpath='{.status.configuration.name}{" "}{.status.conditions[?(@.type=="Updated")].status}{" "}{.status.conditions[?(@.type=="Updating")].status}'
+      environment:
+        KUBECONFIG: "{{ ocp_kubeconfig }}"
+      register: mcp_worker_rollout_ack
+      until: >
+        mcp_worker_rollout_ack.stdout.split()[0] != mcp_worker_before.stdout or
+        mcp_worker_rollout_ack.stdout.split()[2] | default('False') == 'True'
+      retries: 18
+      delay: 10
+      changed_when: false
+      failed_when: false
+      when: ocp_trust_bundle_cm_applied | bool
+
     - name: Wait for worker trust bundle rollout before enabling proxy
       ansible.builtin.command:
         cmd: >-
@@ -246,14 +498,18 @@
       register: mcp_worker_trust_status
       until: >
         mcp_worker_trust_status.stdout.split()[1] | default('') == 'True' and
-        mcp_worker_trust_status.stdout.split()[2] | default('False') == 'False' and
-        (
-          mcp_worker_trust_status.stdout.split()[0] != mcp_worker_before.stdout or
-          'configured' not in trust_bundle_cm_apply.stdout
-        )
+        mcp_worker_trust_status.stdout.split()[2] | default('True') == 'False'
       retries: "{{ ocp_cluster_proxy_mcp_wait_retries }}"
       delay: "{{ ocp_cluster_proxy_mcp_wait_delay }}"
       changed_when: false
+      when: ocp_trust_bundle_cm_applied | bool
+
+    - name: Note skipped worker trust bundle wait (ConfigMap unchanged)
+      ansible.builtin.debug:
+        msg: >-
+          openshift-config/{{ ocp_cluster_trust_bundle_configmap_name }} apply reported unchanged;
+          skipping MachineConfigPool wait (workers should already have the current trust bundle).
+      when: not (ocp_trust_bundle_cm_applied | bool)
 
     - name: "Phase 2 — apply cluster-wide proxy settings"
       ansible.builtin.command:
@@ -318,7 +574,8 @@
         msg:
           - "Cluster httpProxy/httpsProxy: {{ ocp_effective_cluster_proxy_url }}"
           - "Cluster noProxy: {{ ocp_effective_cluster_no_proxy }}"
-          - "Root CA ConfigMap: {{ ocp_cluster_trust_bundle_namespace }}/{{ ocp_cluster_trust_bundle_configmap_name }}"
+          - "Trust bundle ConfigMap: {{ ocp_cluster_trust_bundle_namespace }}/{{ ocp_cluster_trust_bundle_configmap_name }}"
+          - "Trust bundle includes: lab root CA{% if ocp_cluster_trust_include_intermediate_ca | bool %}, cert-manager intermediate CA{% endif %}{% if ocp_cluster_trust_include_ingress_ca | bool %}, ingress router CA{% endif %}{% if ocp_cluster_trust_merge_existing_user_ca_bundle | bool %}, prior user-ca-bundle PEMs{% endif %}"
           - "Cluster Proxy spec.trustedCA.name wired before proxy rollout completes"
           - "Trust bundle manifest: {{ pki_local_export_path }}/cluster-trust-bundle-configmap.yaml"
           - "Full proxy manifest: {{ pki_local_export_path }}/cluster-proxy.yaml"

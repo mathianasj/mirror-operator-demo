@@ -5,4 +5,4 @@ metadata:
   namespace: {{ ocp_cluster_trust_bundle_namespace }}
 data:
   ca-bundle.crt: |
-{{ ocp_root_ca_pem | indent(4, first=True) }}
+{{ ocp_cluster_trust_bundle_pem | indent(4, first=True) }}
