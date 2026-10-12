@@ -137,13 +137,16 @@ sushy_emulator_port: 8000
 sushy_emulator_libvirt_uri: "qemu:///system"
 sushy_emulator_ssl_cert: /etc/sushy/tls/cert.pem
 sushy_emulator_ssl_key: /etc/sushy/tls/key.pem
+sushy_emulator_username: admin
+sushy_emulator_password: "changeme"  # Override with ansible-vault or -e; max 72 chars (bcrypt)
+sushy_emulator_auth_file: /etc/sushy/htpasswd
 
 # OpenShift / ODF
 ocp_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(lookup('env', 'HOME') ~ '/.kube/config', true) }}"
 ocp_verify_ssl: false  # sandbox/lab clusters often use self-signed chains; set true for production
 
 ocp_machineset_namespace: openshift-machine-api
-ocp_worker_machineset_name: ""  # auto-detect when empty and exactly one worker MachineSet exists
+ocp_worker_machineset_name: ""  # auto-detect: sole worker MS, else MS in same AZ as a master node
 ocp_worker_machineset_replicas: 2
 ocp_machineset_scale_timeout: 30m
 

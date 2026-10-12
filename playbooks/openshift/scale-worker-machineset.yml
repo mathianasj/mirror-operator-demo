@@ -42,27 +42,110 @@
         msg: "No worker MachineSets found in {{ ocp_machineset_namespace }}."
       when: worker_machinesets | length == 0
 
-    - name: Resolve target worker MachineSet name
-      ansible.builtin.set_fact:
-        target_worker_machineset_name: >-
-          {{
-            ocp_worker_machineset_name
-            if ocp_worker_machineset_name | length > 0
-            else (
-              worker_machinesets[0].metadata.name
-              if worker_machinesets | length == 1
-              else ''
-            )
-          }}
-
-    - name: Fail when multiple worker MachineSets exist without explicit name
-      ansible.builtin.fail:
-        msg: >-
-          Found {{ worker_machinesets | length }} worker MachineSets.
-          Set ocp_worker_machineset_name to the MachineSet to scale.
+    # When multiple worker MachineSets exist and no name is set, pick the one in
+    # the same AZ as a control-plane (master) node.
+    - name: Get control-plane nodes for AZ matching
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        label_selectors:
+          - "node-role.kubernetes.io/master"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: master_nodes_info
       when:
         - ocp_worker_machineset_name | length == 0
         - worker_machinesets | length > 1
+
+    - name: Get control-plane nodes via control-plane role if needed
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        label_selectors:
+          - "node-role.kubernetes.io/control-plane"
+        kubeconfig: "{{ ocp_kubeconfig }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+      register: control_plane_nodes_info
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+        - (master_nodes_info.resources | default([]) | length) == 0
+
+    - name: Resolve control-plane nodes
+      ansible.builtin.set_fact:
+        control_plane_nodes: "{{ master_nodes_info.resources if (master_nodes_info.resources | default([]) | length) > 0 else (control_plane_nodes_info.resources | default([])) }}"
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+
+    - name: Fail when no control-plane nodes are found for AZ matching
+      ansible.builtin.fail:
+        msg: >-
+          Found {{ worker_machinesets | length }} worker MachineSets but no
+          control-plane nodes to match AZ. Set ocp_worker_machineset_name
+          explicitly.
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+        - control_plane_nodes | length == 0
+
+    - name: Resolve master availability zone
+      ansible.builtin.set_fact:
+        master_availability_zone: "{{ control_plane_nodes[0].metadata.labels['topology.kubernetes.io/zone'] | default(control_plane_nodes[0].metadata.labels['failure-domain.beta.kubernetes.io/zone'] | default('', true), true) }}"
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+        - control_plane_nodes | length > 0
+
+    - name: Fail when master availability zone cannot be determined
+      ansible.builtin.fail:
+        msg: >-
+          Could not read topology.kubernetes.io/zone (or failure-domain.beta.kubernetes.io/zone)
+          from control-plane node {{ control_plane_nodes[0].metadata.name }}.
+          Set ocp_worker_machineset_name explicitly.
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+        - (master_availability_zone | default('') | length) == 0
+
+    - name: Match worker MachineSets to master AZ
+      ansible.builtin.set_fact:
+        worker_machinesets_in_master_az: "{{ worker_machinesets | json_query(az_match_query) }}"
+      vars:
+        az_match_query: "[?metadata.labels.\"machine.openshift.io/zone\"=='{{ master_availability_zone }}' || metadata.labels.\"topology.kubernetes.io/zone\"=='{{ master_availability_zone }}' || spec.template.spec.providerSpec.value.placement.availabilityZone=='{{ master_availability_zone }}']"
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+        - (master_availability_zone | default('') | length) > 0
+
+    - name: Resolve target worker MachineSet name
+      ansible.builtin.set_fact:
+        target_worker_machineset_name: "{{ ocp_worker_machineset_name if ocp_worker_machineset_name | length > 0 else (worker_machinesets[0].metadata.name if worker_machinesets | length == 1 else (worker_machinesets_in_master_az[0].metadata.name if (worker_machinesets_in_master_az | default([]) | length) == 1 else '')) }}"
+
+    - name: Fail when master AZ matches multiple worker MachineSets
+      ansible.builtin.fail:
+        msg: >-
+          Found {{ worker_machinesets_in_master_az | length }} worker MachineSets
+          in master AZ {{ master_availability_zone }}:
+          {{ worker_machinesets_in_master_az | map(attribute='metadata.name') | list | join(', ') }}.
+          Set ocp_worker_machineset_name to the MachineSet to scale.
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - (worker_machinesets_in_master_az | default([]) | length) > 1
+
+    - name: Fail when no worker MachineSet matches master AZ
+      ansible.builtin.fail:
+        msg: >-
+          Found {{ worker_machinesets | length }} worker MachineSets but none in
+          master AZ {{ master_availability_zone }}
+          (node {{ control_plane_nodes[0].metadata.name }}).
+          Available MachineSets:
+          {{ worker_machinesets | map(attribute='metadata.name') | list | join(', ') }}.
+          Set ocp_worker_machineset_name explicitly.
+      when:
+        - ocp_worker_machineset_name | length == 0
+        - worker_machinesets | length > 1
+        - (worker_machinesets_in_master_az | default([]) | length) == 0
 
     - name: Fail when target worker MachineSet could not be resolved
       ansible.builtin.fail:
@@ -147,6 +230,7 @@
       ansible.builtin.debug:
         msg:
           - "MachineSet: {{ target_worker_machineset_name }}"
+          - "Master AZ: {{ master_availability_zone | default('n/a (single MachineSet or explicit name)') }}"
           - "Replicas: {{ current_worker_machineset_replicas }} -> {{ ocp_worker_machineset_replicas }}"
           - "Ready replicas: {{ scaled_machineset_info.resources[0].status.readyReplicas | default(current_worker_machineset_replicas) if scaled_machineset_info is defined else current_worker_machineset_replicas }}"
           - "Available replicas: {{ scaled_machineset_info.resources[0].status.availableReplicas | default(current_worker_machineset_replicas) if scaled_machineset_info is defined else current_worker_machineset_replicas }}"
