@@ -168,12 +168,14 @@
             redfish_vm_endpoints | default([]) + [{
               'vm_name': item.0.item,
               'uuid': item.0.stdout | trim,
-              'mac': item.1.stdout | regex_search("mac address='([0-9a-fA-F:]+)'", '\\1'),
+              'mac': item.1.stdout | regex_findall("mac address=['\"]([0-9a-fA-F:]+)['\"]") | first | default('n/a'),
               'redfish_url': 'https://' ~ sushy_emulator_listen_ip ~ ':' ~ (sushy_emulator_port | string) ~ '/redfish/v1/Systems/' ~ (item.0.stdout | trim)
             }]
           }}
       loop: "{{ vm_uuid_results.results | zip(vm_xml_results.results) | list }}"
-      when: item.0.stdout is defined
+      when:
+        - item.0.stdout is defined
+        - item.1.stdout is defined
 
     - name: Parse Redfish systems response
       ansible.builtin.set_fact:
