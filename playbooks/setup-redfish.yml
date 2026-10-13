@@ -48,11 +48,6 @@
         name: httpd-tools
         state: present
 
-    - name: Install passlib for community.general.htpasswd
-      ansible.builtin.pip:
-        name: passlib
-        state: present
-
     # bcrypt (required by sushy-tools/oslo.middleware) rejects passwords > 72 bytes
     - name: Assert sushy-emulator password fits bcrypt limit
       ansible.builtin.assert:
@@ -63,15 +58,23 @@
           sushy_emulator_password is {{ sushy_emulator_password | length }} characters;
           bcrypt allows at most 72. Shorten the password and re-run.
 
+    # Use htpasswd CLI instead of community.general.htpasswd to avoid passlib/interpreter mismatch
     - name: Create sushy-emulator htpasswd file
-      community.general.htpasswd:
-        path: "{{ sushy_emulator_auth_file }}"
-        name: "{{ sushy_emulator_username }}"
-        password: "{{ sushy_emulator_password }}"
-        crypt_scheme: bcrypt
-        mode: "0600"
-      notify: Restart sushy-emulator
+      ansible.builtin.command:
+        argv:
+          - htpasswd
+          - -cbB
+          - "{{ sushy_emulator_auth_file }}"
+          - "{{ sushy_emulator_username }}"
+          - "{{ sushy_emulator_password }}"
+      changed_when: true
       no_log: true
+      notify: Restart sushy-emulator
+
+    - name: Restrict sushy-emulator htpasswd permissions
+      ansible.builtin.file:
+        path: "{{ sushy_emulator_auth_file }}"
+        mode: "0600"
 
     - name: Deploy sushy-emulator config
       ansible.builtin.template:
