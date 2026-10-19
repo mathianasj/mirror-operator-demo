@@ -109,8 +109,10 @@
         kubeconfig: "{{ ocp_kubeconfig }}"
         validate_certs: "{{ ocp_verify_ssl }}"
       register: clusterissuer_info
+      # k8s_info only returns .resources on success; guard before attribute access
       until: >
-        clusterissuer_info.resources | length > 0 and
+        clusterissuer_info is succeeded and
+        clusterissuer_info.resources | default([]) | length > 0 and
         (
           clusterissuer_info.resources[0].status.conditions | default([])
           | selectattr('type', 'equalto', 'Ready')
@@ -120,6 +122,31 @@
         ) > 0
       retries: 30
       delay: 10
+      failed_when: false
+
+    - name: Fail when ClusterIssuer is not ready
+      ansible.builtin.fail:
+        msg: >-
+          ClusterIssuer {{ cert_manager_issuer_name }} did not become Ready.
+          Ensure the CA Secret exists in the cert-manager cluster resource namespace
+          (default {{ cert_manager_namespace }}/{{ cert_manager_intermediate_secret_name }}).
+          Last status:
+          {{ clusterissuer_info.resources[0].status | default({}) | to_nice_json
+             if (clusterissuer_info is succeeded and
+                 clusterissuer_info.resources | default([]) | length > 0)
+             else (clusterissuer_info.msg | default(clusterissuer_info)) }}
+      when: >
+        not (
+          clusterissuer_info is succeeded and
+          clusterissuer_info.resources | default([]) | length > 0 and
+          (
+            clusterissuer_info.resources[0].status.conditions | default([])
+            | selectattr('type', 'equalto', 'Ready')
+            | selectattr('status', 'equalto', 'True')
+            | list
+            | length
+          ) > 0
+        )
 
     - name: Display ClusterIssuer summary
       ansible.builtin.debug:
