@@ -219,13 +219,13 @@
         dest: /etc/environment.d/proxy.conf
         mode: "0644"
 
-    - name: Configure DNF to use proxy
+    # Hypervisor packages come from AWS RHUI (client certs). Forcing DNF through
+    # Squid ssl_bump breaks those repos; keep DNF direct on this host.
+    - name: Ensure DNF does not use the MITM proxy on the hypervisor
       ansible.builtin.lineinfile:
         path: /etc/dnf/dnf.conf
         regexp: '^proxy='
-        line: "proxy=http://{{ isolated_network_gateway }}:{{ proxy_listen_port }}"
-        create: true
-        mode: "0644"
+        state: absent
 
     # --- Export PKI artifacts to local controller ---
 
@@ -363,6 +363,8 @@
           - >-
             Squid mode:
             {{ 'SSL bump (MITM)' if (proxy_ssl_bump_enabled | bool) else 'forward proxy only — MITM deferred until OpenShift trust bundle rollout' }}
+          - "Hypervisor DNF: direct (no proxy= in dnf.conf; RHUI/CDN in NO_PROXY)"
+          - "NO_PROXY: {{ proxy_no_proxy }}"
           - "cert-manager manifest: {{ pki_local_export_path }}/cert-manager-intermediate-ca.yaml"
           - "ClusterIssuer configured by default at end of site.yml (set cert_manager_configure_issuer=false to skip)"
 

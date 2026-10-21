@@ -79,7 +79,18 @@ proxy_enabled: true
 proxy_listen_address: "0.0.0.0"
 proxy_listen_port: 3128
 proxy_hostname: proxy.example.com
-proxy_no_proxy: "localhost,127.0.0.1,192.168.100.0/24,.example.com"
+# Include RHUI/CDN so client-cert repo traffic is not forced through MITM (ssl_bump breaks mTLS).
+proxy_no_proxy_hosts:
+  - localhost
+  - 127.0.0.1
+  - 192.168.100.0/24
+  - .example.com
+  - cdn.redhat.com
+  - .cdn.redhat.com
+  - subscription.rhsm.redhat.com
+  - .rhsm.redhat.com
+  - .aws.ce.redhat.com
+proxy_no_proxy: "{{ proxy_no_proxy_hosts | join(',') }}"
 proxy_ssl_db_path: /var/spool/squid/ssl_db
 proxy_ssl_db_size: 20MB
 # Source networks allowed to use the proxy (plus built-in "all" ACL as fallback in squid.conf).
