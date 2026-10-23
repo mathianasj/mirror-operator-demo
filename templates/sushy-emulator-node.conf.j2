@@ -1,0 +1,14 @@
+SUSHY_EMULATOR_LISTEN_IP = '{{ item.bmc_ip }}'
+SUSHY_EMULATOR_LISTEN_PORT = {{ bmc_redfish_port }}
+SUSHY_EMULATOR_DRIVER = 'libvirt'
+SUSHY_EMULATOR_LIBVIRT_URI = '{{ sushy_emulator_libvirt_uri }}'
+SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = False
+SUSHY_EMULATOR_VMEDIA_VERIFY_SSL = False
+SUSHY_EMULATOR_SSL_CERT = '{{ sushy_emulator_ssl_cert }}'
+SUSHY_EMULATOR_SSL_KEY = '{{ sushy_emulator_ssl_key }}'
+SUSHY_EMULATOR_AUTH_FILE = '{{ sushy_emulator_auth_file }}'
+# One System per BMC IP (iDRAC-like); allow domain name and UUID
+SUSHY_EMULATOR_ALLOWED_INSTANCES = [
+    '{{ item.name }}',
+    '{{ item.uuid }}',
+]

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Ensure each BMC alias IP exists on the isolated libvirt bridge (idempotent).
+set -euo pipefail
+BRIDGE="{{ isolated_network_bridge }}"
+PREFIX="{{ isolated_network_prefix }}"
+IPS=(
+{% for node in bmc_nodes %}
+  "{{ node.bmc_ip }}"
+{% endfor %}
+)
+
+if ! ip link show "$BRIDGE" &>/dev/null; then
+  echo "bridge $BRIDGE not found" >&2
+  exit 1
+fi
+
+for ip in "${IPS[@]}"; do
+  if ip -4 addr show dev "$BRIDGE" | grep -qF " ${ip}/"; then
+    echo "BMC address ${ip}/${PREFIX} already on ${BRIDGE}"
+  else
+    ip addr add "${ip}/${PREFIX}" dev "$BRIDGE"
+    echo "Added BMC address ${ip}/${PREFIX} on ${BRIDGE}"
+  fi
+done

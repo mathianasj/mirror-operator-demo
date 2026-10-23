@@ -23,11 +23,8 @@
 - name: Create SNO VM
   ansible.builtin.import_playbook: playbooks/create-sno-vm.yml
 
-- name: Set up Redfish simulation
-  ansible.builtin.import_playbook: playbooks/setup-redfish.yml
-
-- name: Set up VirtualBMC for IPMI SOL
-  ansible.builtin.import_playbook: playbooks/setup-virtualbmc.yml
+- name: Set up per-VM Redfish + IPMI BMCs (iDRAC-like)
+  ansible.builtin.import_playbook: playbooks/setup-bmc.yml
 
 - name: OpenShift post-install
   ansible.builtin.import_playbook: playbooks/openshift/site.yml

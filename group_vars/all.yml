@@ -142,30 +142,40 @@ ocp_cluster_trust_merge_existing_user_ca_bundle: true  # preserve PEMs already i
 ocp_cluster_proxy_mcp_wait_retries: 60
 ocp_cluster_proxy_mcp_wait_delay: 20
 
-# Redfish / sushy-emulator
-sushy_emulator_listen_ip: 192.168.100.1
-sushy_emulator_port: 8000
+# BMC emulation (iDRAC-like): one IP per VM; Redfish + IPMI/SOL on that same address
+# IPs must be on the isolated bridge, outside DHCP (.100-.200) and not the gateway.
+bmc_nodes:
+  - name: "{{ bare_vm_name }}"
+    bmc_ip: 192.168.100.50
+  - name: "{{ sno_vm_name }}"
+    bmc_ip: 192.168.100.51
+bmc_redfish_port: 443
+bmc_ipmi_port: 623
+bmc_username: admin
+bmc_password: "changeme"  # Override with ansible-vault or -e; max 72 chars (bcrypt for Redfish)
+
+# Shared sushy TLS / auth (used by each per-node sushy-emulator)
 sushy_emulator_libvirt_uri: "qemu:///system"
 sushy_emulator_ssl_cert: /etc/sushy/tls/cert.pem
 sushy_emulator_ssl_key: /etc/sushy/tls/key.pem
-sushy_emulator_username: admin
-sushy_emulator_password: "changeme"  # Override with ansible-vault or -e; max 72 chars (bcrypt)
 sushy_emulator_auth_file: /etc/sushy/htpasswd
+# Backward-compatible aliases (same credentials as bmc_*)
+sushy_emulator_username: "{{ bmc_username }}"
+sushy_emulator_password: "{{ bmc_password }}"
+sushy_emulator_listen_ip: "{{ (bmc_nodes | first).bmc_ip }}"
+sushy_emulator_port: "{{ bmc_redfish_port }}"
 
-# VirtualBMC / IPMI SOL (alongside Redfish; one UDP port per libvirt domain)
-vbmc_listen_ip: "{{ isolated_network_gateway }}"
+# VirtualBMC install paths
 vbmc_libvirt_uri: "qemu:///system"
-vbmc_username: admin
-vbmc_password: "changeme"  # Override with ansible-vault or -e
+vbmc_username: "{{ bmc_username }}"
+vbmc_password: "{{ bmc_password }}"
 vbmc_install_dir: /opt/virtualbmc
 vbmc_config_dir: /etc/virtualbmc
 vbmc_state_dir: /var/lib/virtualbmc
 vbmc_log_dir: /var/log/virtualbmc
-vbmc_domains:
-  - name: "{{ bare_vm_name }}"
-    port: 6230
-  - name: "{{ sno_vm_name }}"
-    port: 6231
+# Derived for older references: name + IPMI port on each node's BMC IP
+vbmc_domains: "{{ bmc_nodes | map('combine', {'port': bmc_ipmi_port}) | list }}"
+vbmc_listen_ip: "{{ (bmc_nodes | first).bmc_ip }}"
 
 # OpenShift / ODF
 ocp_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(lookup('env', 'HOME') ~ '/.kube/config', true) }}"

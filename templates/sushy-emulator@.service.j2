@@ -1,0 +1,13 @@
+[Unit]
+Description=Sushy Redfish BMC for %i
+After=network-online.target bmc-addresses.service libvirtd.service virtqemud.service
+Wants=network-online.target bmc-addresses.service libvirtd.service virtqemud.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sushy-emulator --config /etc/sushy/nodes/%i.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -60,5 +60,6 @@
       ansible.builtin.debug:
         msg: |
           SNO VM UUID: {{ sno_vm_uuid.stdout }}
-          Redfish System: https://{{ sushy_emulator_listen_ip }}:{{ sushy_emulator_port }}/redfish/v1/Systems/{{ sno_vm_uuid.stdout }}
-          IPMI/SOL: ipmitool -I lanplus -C 3 -H {{ vbmc_listen_ip }} -p {{ (vbmc_domains | selectattr('name', 'equalto', sno_vm_name) | map(attribute='port') | first) }} -U {{ vbmc_username }} -P <password> sol activate
+          BMC IP: {{ (bmc_nodes | selectattr('name', 'equalto', sno_vm_name) | map(attribute='bmc_ip') | first) }}
+          Redfish: https://{{ (bmc_nodes | selectattr('name', 'equalto', sno_vm_name) | map(attribute='bmc_ip') | first) }}:{{ bmc_redfish_port }}/redfish/v1/Systems/{{ sno_vm_uuid.stdout }}
+          IPMI/SOL: ipmitool -I lanplus -C 3 -H {{ (bmc_nodes | selectattr('name', 'equalto', sno_vm_name) | map(attribute='bmc_ip') | first) }} -p {{ bmc_ipmi_port }} -U {{ bmc_username }} -P <password> sol activate

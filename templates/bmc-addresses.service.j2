@@ -1,0 +1,12 @@
+[Unit]
+Description=Add per-VM BMC IP aliases on {{ isolated_network_bridge }}
+After=network-online.target libvirtd.service virtqemud.service
+Wants=network-online.target libvirtd.service virtqemud.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bmc-addresses.sh
+
+[Install]
+WantedBy=multi-user.target

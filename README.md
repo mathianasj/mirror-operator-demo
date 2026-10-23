@@ -1,6 +1,6 @@
 # Mirror Operator Demo
 
-Ansible automation for a KVM hypervisor lab on AWS bare metal. The top-level playbook provisions an EC2 host, configures KVM/GNOME/VNC, creates an isolated libvirt network, and deploys a RHEL 9 mirror workstation plus demo VMs with Redfish (sushy) and IPMI SOL (VirtualBMC) simulation.
+Ansible automation for a KVM hypervisor lab on AWS bare metal. The top-level playbook provisions an EC2 host, configures KVM/GNOME/VNC, creates an isolated libvirt network, and deploys a RHEL 9 mirror workstation plus demo VMs with iDRAC-like BMCs (per-VM IP: Redfish + IPMI/SOL).
 
 After the hypervisor lab, root [`site.yml`](site.yml) imports [`playbooks/openshift/site.yml`](playbooks/openshift/site.yml) as a single sub-playbook (same file you can run alone for cluster-only work).
 
@@ -34,19 +34,18 @@ Ansible reads [`ansible.cfg`](ansible.cfg): inventory [`inventory/hosts.yml`](in
 6. [`playbooks/create-fedora-vm.yml`](playbooks/create-fedora-vm.yml) — RHEL 9 mirror workstation (FIPS + DISA STIG)
 7. [`playbooks/create-bare-vm.yml`](playbooks/create-bare-vm.yml) — bare VM with extra disk
 8. [`playbooks/create-sno-vm.yml`](playbooks/create-sno-vm.yml) — SNO demo VM
-9. [`playbooks/setup-redfish.yml`](playbooks/setup-redfish.yml) — sushy Redfish emulator
-10. [`playbooks/setup-virtualbmc.yml`](playbooks/setup-virtualbmc.yml) — VirtualBMC IPMI / SOL
+9. [`playbooks/setup-bmc.yml`](playbooks/setup-bmc.yml) — per-VM BMC (Redfish + IPMI/SOL on one IP, iDRAC-like)
 
 **OpenShift** (via [`playbooks/openshift/site.yml`](playbooks/openshift/site.yml))
 
-11. [`connect-cluster.yml`](playbooks/openshift/connect-cluster.yml) — kubeconfig, version/channel facts
-12. [`configure-cluster-proxy.yml`](playbooks/openshift/configure-cluster-proxy.yml) — trust bundle + proxy URLs, then [`enable-proxy-mitm.yml`](playbooks/enable-proxy-mitm.yml)
-13. [`configure-cert-manager-issuer.yml`](playbooks/openshift/configure-cert-manager-issuer.yml) — ClusterIssuer
-14. [`scale-worker-machineset.yml`](playbooks/openshift/scale-worker-machineset.yml) — worker MachineSet replicas
-15. [`create-gp3-high-perf-sc.yml`](playbooks/openshift/create-gp3-high-perf-sc.yml) — high-performance `StorageClass`
-16. [`install-odf-noobaa.yml`](playbooks/openshift/install-odf-noobaa.yml) — ODF / NooBaa operator install
-17. [`configure-noobaa-backing-store.yml`](playbooks/openshift/configure-noobaa-backing-store.yml) — NooBaa backing store
-18. [`validate-odf-noobaa.yml`](playbooks/openshift/validate-odf-noobaa.yml) — health checks
+10. [`connect-cluster.yml`](playbooks/openshift/connect-cluster.yml) — kubeconfig, version/channel facts
+11. [`configure-cluster-proxy.yml`](playbooks/openshift/configure-cluster-proxy.yml) — trust bundle + proxy URLs, then [`enable-proxy-mitm.yml`](playbooks/enable-proxy-mitm.yml)
+12. [`configure-cert-manager-issuer.yml`](playbooks/openshift/configure-cert-manager-issuer.yml) — ClusterIssuer
+13. [`scale-worker-machineset.yml`](playbooks/openshift/scale-worker-machineset.yml) — worker MachineSet replicas
+14. [`create-gp3-high-perf-sc.yml`](playbooks/openshift/create-gp3-high-perf-sc.yml) — high-performance `StorageClass`
+15. [`install-odf-noobaa.yml`](playbooks/openshift/install-odf-noobaa.yml) — ODF / NooBaa operator install
+16. [`configure-noobaa-backing-store.yml`](playbooks/openshift/configure-noobaa-backing-store.yml) — NooBaa backing store
+17. [`validate-odf-noobaa.yml`](playbooks/openshift/validate-odf-noobaa.yml) — health checks
 
 All configuration flows from [`group_vars/all.yml`](group_vars/all.yml), inventory, CLI extra-vars (`-e`), and external prerequisites. There is no playbook-level `vars:` block in `site.yml`.
 
@@ -70,10 +69,10 @@ These are not set in `group_vars/all.yml` and must be provided at runtime:
 [`inventory/hosts.yml`](inventory/hosts.yml) defines an empty `hypervisors` group. **Do not commit static EC2 public IPs** — they go stale when instances are terminated.
 
 - **Full `site.yml` run:** `provision-ec2.yml` dynamically adds the live EC2 public IP to `hypervisors` via `add_host`.
-- **Re-run child playbooks only** (skip `provision-ec2.yml`): [`playbooks/discover-hypervisors.yml`](playbooks/discover-hypervisors.yml) looks up running instances tagged `Name={{ ec2_instance_name }}` and `add_host`s them (needs AWS credentials + `keys/{{ ec2_key_name }}.pem`). `setup-virtualbmc.yml` imports this automatically. For other playbooks:
+- **Re-run child playbooks only** (skip `provision-ec2.yml`): [`playbooks/discover-hypervisors.yml`](playbooks/discover-hypervisors.yml) looks up running instances tagged `Name={{ ec2_instance_name }}` and `add_host`s them (needs AWS credentials + `keys/{{ ec2_key_name }}.pem`). `setup-bmc.yml` imports this automatically. For other playbooks:
 
 ```bash
-ansible-playbook playbooks/discover-hypervisors.yml playbooks/setup-redfish.yml
+ansible-playbook playbooks/discover-hypervisors.yml playbooks/create-bare-vm.yml
 ```
 
 Or temporarily add the current public IP to `inventory/hosts.yml`.
@@ -190,38 +189,29 @@ Kickstart is rendered from [`templates/rhel-kickstart.cfg.j2`](templates/rhel-ki
 | `sno_vm_memory_mb` | `24576` |
 | `sno_vm_disk_size_gb` | `120` |
 
-### Redfish / sushy-emulator (`setup-redfish.yml`)
+### Per-VM BMC / iDRAC-like (`setup-bmc.yml`)
+
+Each managed libvirt VM gets its own BMC IP on the isolated bridge. **Redfish and IPMI/SOL share that IP** (like iDRAC): HTTPS `:443` and IPMI UDP `:623`. One `sushy-emulator@<vm>` process per node (`SUSHY_EMULATOR_ALLOWED_INSTANCES` = that VM only) plus VirtualBMC bound to the same address.
 
 | Variable | Default |
 |----------|---------|
-| `sushy_emulator_listen_ip` | `192.168.100.1` |
-| `sushy_emulator_port` | `8000` |
-| `sushy_emulator_libvirt_uri` | `qemu:///system` |
-| `sushy_emulator_ssl_cert` | `/etc/sushy/tls/cert.pem` |
-| `sushy_emulator_ssl_key` | `/etc/sushy/tls/key.pem` |
+| `bmc_nodes` | `bare-vm` → `192.168.100.50`, `sno-vm` → `192.168.100.51` |
+| `bmc_redfish_port` | `443` |
+| `bmc_ipmi_port` | `623` |
+| `bmc_username` / `bmc_password` | `admin` / `"changeme"` |
+| `vbmc_install_dir` | `/opt/virtualbmc` |
 
-Config from [`templates/sushy-emulator.conf.j2`](templates/sushy-emulator.conf.j2). A self-signed TLS certificate is generated on first run.
-
-### VirtualBMC / IPMI SOL (`setup-virtualbmc.yml`)
-
-Runs beside sushy: Redfish for power/boot/media, VirtualBMC for IPMI including Serial-over-LAN. Each libvirt domain gets its own UDP IPMI port on the isolated gateway. Ensures a PTY serial console exists on each managed domain (also added at create time for bare/SNO VMs).
-
-| Variable | Default |
-|----------|---------|
-| `vbmc_listen_ip` | `{{ isolated_network_gateway }}` (`192.168.100.1`) |
-| `vbmc_libvirt_uri` | `qemu:///system` |
-| `vbmc_username` | `admin` |
-| `vbmc_password` | `"changeme"` |
-| `vbmc_install_dir` | `/opt/virtualbmc` (venv with system `python3-libvirt`) |
-| `vbmc_domains` | `bare-vm:6230`, `sno-vm:6231` |
-
-Config from [`templates/virtualbmc.conf.j2`](templates/virtualbmc.conf.j2). Example SOL session:
+Example (same host for both protocols):
 
 ```bash
-ipmitool -I lanplus -C 3 -H 192.168.100.1 -p 6230 -U admin -P changeme sol activate
+# Redfish
+curl -sk -u admin:changeme https://192.168.100.50/redfish/v1/Systems/
+
+# IPMI SOL (disconnect virsh console first; exit with Enter then ~.)
+ipmitool -I lanplus -C 3 -H 192.168.100.50 -p 623 -U admin -P changeme sol activate
 ```
 
-Disconnect any `virsh console` session first; exit SOL with Enter then `~.`.
+Your other playbook can treat `bmc_ip` like an iDRAC address: Redfish base `https://<bmc_ip>/` and IPMI `<bmc_ip>:623`.
 
 ### Corporate proxy and PKI (`setup-proxy.yml`)
 
