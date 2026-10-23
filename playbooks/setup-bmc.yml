@@ -171,19 +171,23 @@
         - "{{ vbmc_install_dir }}/bin/vbmcd"
       register: vbmc_scripts
 
+    - name: Record whether VirtualBMC console scripts exist
+      ansible.builtin.set_fact:
+        vbmc_scripts_ok: "{{ vbmc_scripts.results | map(attribute='stat.exists') | list | min | bool }}"
+
     # If scripts are still missing, wipe the venv, recreate with Python >= 3.11, reinstall once.
     - name: Remove VirtualBMC virtualenv after missing console scripts
       ansible.builtin.file:
         path: "{{ vbmc_install_dir }}"
         state: absent
-      when: not (vbmc_scripts.results | map(attribute='stat.exists') | min)
+      when: not (vbmc_scripts_ok | bool)
 
     - name: Recreate VirtualBMC virtualenv after missing console scripts
       ansible.builtin.command:
         cmd: >-
           {{ vbmc_python }} -m venv --system-site-packages
           {{ vbmc_install_dir }}
-      when: not (vbmc_scripts.results | map(attribute='stat.exists') | min)
+      when: not (vbmc_scripts_ok | bool)
 
     - name: Re-upgrade pip after VirtualBMC venv recreate
       ansible.builtin.command:
@@ -192,7 +196,7 @@
           'pip>=23' setuptools wheel
       register: vbmc_pip_bootstrap_retry
       changed_when: "'Successfully installed' in vbmc_pip_bootstrap_retry.stdout"
-      when: not (vbmc_scripts.results | map(attribute='stat.exists') | min)
+      when: not (vbmc_scripts_ok | bool)
 
     - name: Reinstall virtualbmc after VirtualBMC venv recreate
       ansible.builtin.command:
@@ -205,7 +209,7 @@
         'Successfully installed' in vbmc_pip_install_retry.stdout
         or 'Successfully uninstalled' in vbmc_pip_install_retry.stdout
       notify: Restart vbmcd
-      when: not (vbmc_scripts.results | map(attribute='stat.exists') | min)
+      when: not (vbmc_scripts_ok | bool)
 
     - name: Reinstall VirtualBMC Python dependencies after venv recreate
       ansible.builtin.command:
@@ -217,7 +221,7 @@
           'pyzmq>=19.0.0'
       register: vbmc_pip_deps_retry
       changed_when: "'Successfully installed' in vbmc_pip_deps_retry.stdout"
-      when: not (vbmc_scripts.results | map(attribute='stat.exists') | min)
+      when: not (vbmc_scripts_ok | bool)
 
     - name: Re-check VirtualBMC console scripts after recreate
       ansible.builtin.stat:
@@ -226,7 +230,15 @@
         - "{{ vbmc_install_dir }}/bin/vbmc"
         - "{{ vbmc_install_dir }}/bin/vbmcd"
       register: vbmc_scripts_final
-      when: not (vbmc_scripts.results | map(attribute='stat.exists') | min)
+      when: not (vbmc_scripts_ok | bool)
+
+    - name: Update console-script OK flag after recreate
+      ansible.builtin.set_fact:
+        vbmc_scripts_ok: "{{ vbmc_scripts_final.results | map(attribute='stat.exists') | list | min | bool }}"
+      when:
+        - not (vbmc_scripts_ok | bool)
+        - vbmc_scripts_final is defined
+        - vbmc_scripts_final.results is defined
 
     - name: Fail when vbmc/vbmcd scripts are missing
       ansible.builtin.fail:
@@ -237,11 +249,7 @@
           pip stderr: {{ (vbmc_pip_install_retry.stderr | default(vbmc_pip_install.stderr)) | default('') }}.
           Fix (as root): recreate {{ vbmc_install_dir }} with {{ vbmc_python }} -m venv
           --system-site-packages and reinstall {{ vbmc_pip_package }}.
-      when: >-
-        not (
-          (vbmc_scripts_final.results | default(vbmc_scripts.results))
-          | map(attribute='stat.exists') | min
-        )
+      when: not (vbmc_scripts_ok | bool)
 
     - name: Create BMC directories
       ansible.builtin.file:
