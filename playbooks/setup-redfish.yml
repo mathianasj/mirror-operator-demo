@@ -90,8 +90,9 @@
         content: |
           [Unit]
           Description=Sushy Redfish Emulator
-          After=libvirtd.service
-          Requires=libvirtd.service
+          After=libvirtd.service virtqemud.service
+          Wants=libvirtd.service virtqemud.service
+          # Soft deps: Fedora modular libvirt uses virtqemud, not libvirtd.
 
           [Service]
           ExecStart=/usr/local/bin/sushy-emulator --config /etc/sushy/sushy-emulator.conf

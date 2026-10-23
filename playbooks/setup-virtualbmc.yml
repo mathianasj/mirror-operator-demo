@@ -77,9 +77,10 @@
         content: |
           [Unit]
           Description=VirtualBMC IPMI emulator
-          After=libvirtd.service network-online.target
-          Requires=libvirtd.service
-          Wants=network-online.target
+          After=network-online.target libvirtd.service virtqemud.service
+          Wants=network-online.target libvirtd.service virtqemud.service
+          # Do not Require= a specific libvirt unit: Fedora modular stacks use
+          # virtqemud.service, while older hosts use monolithic libvirtd.service.
 
           [Service]
           Type=simple
