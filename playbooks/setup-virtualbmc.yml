@@ -1,4 +1,7 @@
 ---
+- name: Discover existing hypervisor EC2 instances
+  ansible.builtin.import_playbook: discover-hypervisors.yml
+
 - name: Set up VirtualBMC for IPMI / Serial-over-LAN
   hosts: hypervisors
   become: true

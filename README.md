@@ -70,7 +70,13 @@ These are not set in `group_vars/all.yml` and must be provided at runtime:
 [`inventory/hosts.yml`](inventory/hosts.yml) defines an empty `hypervisors` group. **Do not commit static EC2 public IPs** — they go stale when instances are terminated.
 
 - **Full `site.yml` run:** `provision-ec2.yml` dynamically adds the live EC2 public IP to `hypervisors` via `add_host`.
-- **Re-run child playbooks only** (skip `provision-ec2.yml`): temporarily add the current public IP to `inventory/hosts.yml`, or use `--limit <current-ip>`.
+- **Re-run child playbooks only** (skip `provision-ec2.yml`): [`playbooks/discover-hypervisors.yml`](playbooks/discover-hypervisors.yml) looks up running instances tagged `Name={{ ec2_instance_name }}` and `add_host`s them (needs AWS credentials + `keys/{{ ec2_key_name }}.pem`). `setup-virtualbmc.yml` imports this automatically. For other playbooks:
+
+```bash
+ansible-playbook playbooks/discover-hypervisors.yml playbooks/setup-redfish.yml
+```
+
+Or temporarily add the current public IP to `inventory/hosts.yml`.
 
 If you see `UNREACHABLE` on an old IP like `18.218.36.100`, that host was left in inventory from a previous session. Clear `inventory/hosts.yml` and re-run, or limit to the current host:
 

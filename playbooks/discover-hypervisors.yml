@@ -1,0 +1,89 @@
+---
+# Look up running EC2 hypervisors tagged by provision-ec2.yml and add them to
+# the in-memory hypervisors inventory. Safe to import before any child playbook
+# when skipping a full site.yml / provision-ec2 run.
+- name: Discover existing hypervisor EC2 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Decide whether EC2 discovery is needed
+      ansible.builtin.set_fact:
+        hypervisor_discovery_needed: "{{ (groups['hypervisors'] | default([]) | length) == 0 }}"
+
+    - name: Skip discovery when hypervisors are already in inventory
+      ansible.builtin.debug:
+        msg: >-
+          hypervisors already set ({{ groups['hypervisors'] | join(', ') }});
+          skipping EC2 lookup.
+      when: not (hypervisor_discovery_needed | bool)
+
+    - name: Build expected hypervisor Name tags
+      ansible.builtin.set_fact:
+        ec2_instance_names: >-
+          {{ (ec2_instance_count | int == 1)
+             | ternary(
+                 [ec2_instance_name],
+                 range(1, (ec2_instance_count | int) + 1)
+                 | map('regex_replace', '^(.*)$', ec2_instance_name ~ '-\1')
+                 | list
+               ) }}
+      when: hypervisor_discovery_needed | bool
+
+    - name: Find running EC2 instances for hypervisor names
+      amazon.aws.ec2_instance_info:
+        filters:
+          instance-state-name: running
+          "tag:Name": "{{ ec2_instance_names }}"
+      register: discovered_ec2
+      when: hypervisor_discovery_needed | bool
+
+    - name: Fail when no running hypervisor instances were found
+      ansible.builtin.fail:
+        msg: >-
+          No running EC2 instances found with Name tag in
+          {{ ec2_instance_names | join(', ') }}.
+          Launch with playbooks/provision-ec2.yml or check AWS region/credentials.
+      when:
+        - hypervisor_discovery_needed | bool
+        - (discovered_ec2.instances | default([]) | length) == 0
+
+    - name: Fail when a discovered instance has no public IP
+      ansible.builtin.fail:
+        msg: >-
+          Instance {{ item.instance_id }} ({{ item.tags.Name | default('unnamed') }})
+          has no public IP address.
+      loop: "{{ discovered_ec2.instances | default([]) }}"
+      when:
+        - hypervisor_discovery_needed | bool
+        - (item.public_ip_address | default('') | length) == 0
+      loop_control:
+        label: "{{ item.instance_id }}"
+
+    - name: Add discovered instances to hypervisors inventory
+      ansible.builtin.add_host:
+        name: "{{ item.public_ip_address }}"
+        groups: hypervisors
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "{{ ec2_key_local_path }}/{{ ec2_key_name }}.pem"
+        ansible_python_interpreter: /usr/bin/python3
+      loop: "{{ discovered_ec2.instances | default([]) }}"
+      when: hypervisor_discovery_needed | bool
+      loop_control:
+        label: "{{ item.tags.Name | default(item.instance_id) }} {{ item.public_ip_address }}"
+
+    - name: Display discovered hypervisors
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.tags.Name | default(item.instance_id) }}:
+          {{ item.public_ip_address }}
+          ({{ item.instance_id }})
+          SSH: ssh -i {{ ec2_key_local_path }}/{{ ec2_key_name }}.pem
+          ec2-user@{{ item.public_ip_address }}
+      loop: "{{ discovered_ec2.instances | default([]) }}"
+      when: hypervisor_discovery_needed | bool
+      loop_control:
+        label: "{{ item.public_ip_address }}"
