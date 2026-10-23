@@ -27,7 +27,6 @@
           - python3
           - python3-pip
           - python3-libvirt
-          - python3.11
           - git
           - ipmitool
           - httpd-tools
@@ -40,39 +39,13 @@
       register: sushy_pip_install
       changed_when: "'Successfully installed' in sushy_pip_install.stdout"
 
-    # VirtualBMC master needs Python >= 3.11. Prefer the newest available interpreter.
-    - name: Discover Python >= 3.11 for VirtualBMC venv
-      ansible.builtin.shell: |
-        set -e
-        for cand in /usr/bin/python3.14 /usr/bin/python3.13 /usr/bin/python3.12 /usr/bin/python3.11; do
-          if [ -x "$cand" ]; then
-            ver="$("$cand" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-            major="${ver%%.*}"
-            minor="${ver#*.}"
-            if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 11 ]; }; then
-              echo "$cand"
-              exit 0
-            fi
-          fi
-        done
-        exit 1
-      args:
-        executable: /bin/bash
-      register: vbmc_python_discover
-      changed_when: false
-      failed_when: false
-
-    - name: Fail when no Python >= 3.11 is available for VirtualBMC
-      ansible.builtin.fail:
-        msg: >-
-          VirtualBMC master requires Python >= 3.11, but none of
-          /usr/bin/python3.11–3.14 were found. Install python3.11 (or newer)
-          and re-run setup-bmc.yml.
-      when: vbmc_python_discover.rc != 0
-
+    # Use platform python3 + system-site-packages so distro python3-libvirt works.
+    # VirtualBMC master declares requires-python>=3.11; ignore that marker (SOL runs
+    # on 3.9). Building libvirt-python for 3.11 needs libvirt-devel from CRB, which
+    # is often unavailable on these hypervisors.
     - name: Set VirtualBMC Python interpreter
       ansible.builtin.set_fact:
-        vbmc_python: "{{ vbmc_python_discover.stdout | trim }}"
+        vbmc_python: /usr/bin/python3
 
     - name: Check for existing VirtualBMC virtualenv
       ansible.builtin.stat:
@@ -90,16 +63,13 @@
       register: vbmc_pyvenv_cfg
       when: vbmc_pyvenv_cfg_stat.stat.exists
 
-    - name: Probe existing VirtualBMC venv Python version
+    - name: Probe existing VirtualBMC venv for libvirt import
       ansible.builtin.command:
         argv:
           - "{{ vbmc_install_dir }}/bin/python"
           - -c
-          - |
-            import sys
-            print("%d.%d" % sys.version_info[:2])
-            raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)
-      register: vbmc_venv_py_ver
+          - import libvirt; print(libvirt.getVersion())
+      register: vbmc_venv_libvirt
       changed_when: false
       failed_when: false
       when: vbmc_venv_python_stat.stat.exists
@@ -109,7 +79,7 @@
         vbmc_recreate_venv: "{{
             (not vbmc_pyvenv_cfg_stat.stat.exists)
             or (not vbmc_venv_python_stat.stat.exists)
-            or (vbmc_venv_py_ver.rc | default(1) != 0)
+            or (vbmc_venv_libvirt.rc | default(1) != 0)
             or (
               vbmc_pyvenv_cfg_stat.stat.exists
               and ('include-system-site-packages = true'
@@ -117,13 +87,13 @@
             )
           }}"
 
-    - name: Remove broken or outdated VirtualBMC virtualenv
+    - name: Remove broken or mismatched VirtualBMC virtualenv
       ansible.builtin.file:
         path: "{{ vbmc_install_dir }}"
         state: absent
       when: vbmc_recreate_venv
 
-    - name: Create VirtualBMC virtualenv with Python >= 3.11
+    - name: Create VirtualBMC virtualenv with system site packages
       ansible.builtin.command:
         cmd: >-
           {{ vbmc_python }} -m venv --system-site-packages
@@ -144,7 +114,7 @@
       ansible.builtin.command:
         cmd: >-
           {{ vbmc_install_dir }}/bin/pip install --upgrade --force-reinstall
-          --no-deps
+          --no-deps --ignore-requires-python
           {{ vbmc_pip_package }}
       register: vbmc_pip_install
       changed_when: >-
@@ -163,6 +133,14 @@
       register: vbmc_pip_deps
       changed_when: "'Successfully installed' in vbmc_pip_deps.stdout"
 
+    - name: Verify VirtualBMC venv can import libvirt
+      ansible.builtin.command:
+        argv:
+          - "{{ vbmc_install_dir }}/bin/python"
+          - -c
+          - import libvirt; print(libvirt.getVersion())
+      changed_when: false
+
     - name: Check VirtualBMC console scripts after install
       ansible.builtin.stat:
         path: "{{ item }}"
@@ -175,7 +153,7 @@
       ansible.builtin.set_fact:
         vbmc_scripts_ok: "{{ vbmc_scripts.results | map(attribute='stat.exists') | list | min | bool }}"
 
-    # If scripts are still missing, wipe the venv, recreate with Python >= 3.11, reinstall once.
+    # If scripts are still missing, wipe the venv, recreate, reinstall once.
     - name: Remove VirtualBMC virtualenv after missing console scripts
       ansible.builtin.file:
         path: "{{ vbmc_install_dir }}"
@@ -202,7 +180,7 @@
       ansible.builtin.command:
         cmd: >-
           {{ vbmc_install_dir }}/bin/pip install --upgrade --force-reinstall
-          --no-deps
+          --no-deps --ignore-requires-python
           {{ vbmc_pip_package }}
       register: vbmc_pip_install_retry
       changed_when: >-
@@ -221,6 +199,15 @@
           'pyzmq>=19.0.0'
       register: vbmc_pip_deps_retry
       changed_when: "'Successfully installed' in vbmc_pip_deps_retry.stdout"
+      when: not (vbmc_scripts_ok | bool)
+
+    - name: Re-verify VirtualBMC venv can import libvirt after recreate
+      ansible.builtin.command:
+        argv:
+          - "{{ vbmc_install_dir }}/bin/python"
+          - -c
+          - import libvirt; print(libvirt.getVersion())
+      changed_when: false
       when: not (vbmc_scripts_ok | bool)
 
     - name: Re-check VirtualBMC console scripts after recreate
@@ -248,7 +235,7 @@
           pip stdout: {{ (vbmc_pip_install_retry.stdout | default(vbmc_pip_install.stdout)) | default('') }}
           pip stderr: {{ (vbmc_pip_install_retry.stderr | default(vbmc_pip_install.stderr)) | default('') }}.
           Fix (as root): recreate {{ vbmc_install_dir }} with {{ vbmc_python }} -m venv
-          --system-site-packages and reinstall {{ vbmc_pip_package }}.
+          --system-site-packages and reinstall with --ignore-requires-python {{ vbmc_pip_package }}.
       when: not (vbmc_scripts_ok | bool)
 
     - name: Create BMC directories
