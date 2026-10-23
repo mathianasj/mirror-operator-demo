@@ -173,6 +173,10 @@ vbmc_install_dir: /opt/virtualbmc
 vbmc_config_dir: /etc/virtualbmc
 vbmc_state_dir: /var/lib/virtualbmc
 vbmc_log_dir: /var/log/virtualbmc
+# Install from GitHub master (includes SOL). PyPI 3.3.0 does not ship SOL.
+# OpenDev is canonical; GitHub openstack/virtualbmc is the public mirror.
+# Use git+ URL so pbr can derive a version (zip archives fail metadata generation).
+vbmc_pip_package: "git+https://github.com/openstack/virtualbmc.git@master"
 # Derived for older references: name + IPMI port on each node's BMC IP
 vbmc_domains: "{{ bmc_nodes | map('combine', {'port': bmc_ipmi_port}) | list }}"
 vbmc_listen_ip: "{{ (bmc_nodes | first).bmc_ip }}"

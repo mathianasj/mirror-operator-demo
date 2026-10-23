@@ -27,6 +27,7 @@
           - python3
           - python3-pip
           - python3-libvirt
+          - git
           - ipmitool
           - httpd-tools
           - openssl
@@ -62,13 +63,18 @@
         cmd: /usr/bin/python3 -m venv --system-site-packages {{ vbmc_install_dir }}
         creates: "{{ vbmc_install_dir }}/bin/python"
 
-    - name: Install virtualbmc into dedicated virtualenv
+    # Install from GitHub master (ships SOL). PyPI 3.3.0 has power/boot only.
+    # Canonical source is OpenDev; GitHub openstack/virtualbmc is the public mirror.
+    - name: Install virtualbmc from GitHub master into dedicated virtualenv
       ansible.builtin.command:
         cmd: >-
           {{ vbmc_install_dir }}/bin/pip install --upgrade
-          --no-deps virtualbmc
+          --no-deps
+          {{ vbmc_pip_package }}
       register: vbmc_pip_install
-      changed_when: "'Successfully installed' in vbmc_pip_install.stdout"
+      changed_when: >-
+        'Successfully installed' in vbmc_pip_install.stdout
+        or 'Successfully uninstalled' in vbmc_pip_install.stdout
 
     - name: Install VirtualBMC Python dependencies (except libvirt-python)
       ansible.builtin.command:

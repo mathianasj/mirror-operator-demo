@@ -193,6 +193,8 @@ Kickstart is rendered from [`templates/rhel-kickstart.cfg.j2`](templates/rhel-ki
 
 Each managed libvirt VM gets its own BMC IP on the isolated bridge. **Redfish and IPMI/SOL share that IP** (like iDRAC): HTTPS `:443` and IPMI UDP `:623`. One `sushy-emulator@<vm>` process per node (`SUSHY_EMULATOR_ALLOWED_INSTANCES` = that VM only) plus VirtualBMC bound to the same address.
 
+VirtualBMC is installed from **GitHub `openstack/virtualbmc` master** (`vbmc_pip_package`), not PyPI 3.3.0, because only master ships Serial-over-LAN (`sol.py` + `activate_payload`). Disconnect `virsh console` before `sol activate`. `sol payload status/enable` and `sol info`/`sol set` are still unimplemented upstream.
+
 | Variable | Default |
 |----------|---------|
 | `bmc_nodes` | `bare-vm` → `192.168.100.50`, `sno-vm` → `192.168.100.51` |
@@ -200,6 +202,7 @@ Each managed libvirt VM gets its own BMC IP on the isolated bridge. **Redfish an
 | `bmc_ipmi_port` | `623` |
 | `bmc_username` / `bmc_password` | `admin` / `"changeme"` |
 | `vbmc_install_dir` | `/opt/virtualbmc` |
+| `vbmc_pip_package` | `git+https://github.com/openstack/virtualbmc.git@master` |
 
 Example (same host for both protocols):
 
