@@ -21,13 +21,37 @@
           - pkgconf-pkg-config
         state: present
 
+    # Avoid ansible.builtin.pip here: with ansible_python_interpreter=/usr/bin/python3
+    # that module requires distro python3-packaging, which may be missing.
+    - name: Check for existing VirtualBMC virtualenv
+      ansible.builtin.stat:
+        path: "{{ vbmc_install_dir }}/pyvenv.cfg"
+      register: vbmc_pyvenv_cfg_stat
+
+    - name: Read VirtualBMC pyvenv.cfg
+      ansible.builtin.slurp:
+        src: "{{ vbmc_install_dir }}/pyvenv.cfg"
+      register: vbmc_pyvenv_cfg
+      when: vbmc_pyvenv_cfg_stat.stat.exists
+
+    - name: Remove VirtualBMC virtualenv lacking system site packages
+      ansible.builtin.file:
+        path: "{{ vbmc_install_dir }}"
+        state: absent
+      when:
+        - vbmc_pyvenv_cfg_stat.stat.exists
+        - "'include-system-site-packages = true' not in (vbmc_pyvenv_cfg.content | b64decode)"
+
+    - name: Create VirtualBMC virtualenv with system site packages
+      ansible.builtin.command:
+        cmd: /usr/bin/python3 -m venv --system-site-packages {{ vbmc_install_dir }}
+        creates: "{{ vbmc_install_dir }}/bin/python"
+
     - name: Install virtualbmc into dedicated virtualenv
-      ansible.builtin.pip:
-        name: virtualbmc
-        state: present
-        virtualenv: "{{ vbmc_install_dir }}"
-        virtualenv_command: /usr/bin/python3 -m venv
-        virtualenv_site_packages: true
+      ansible.builtin.command:
+        cmd: "{{ vbmc_install_dir }}/bin/pip install --upgrade virtualbmc"
+      register: vbmc_pip_install
+      changed_when: "'Successfully installed' in vbmc_pip_install.stdout"
 
     - name: Create VirtualBMC directories
       ansible.builtin.file:
