@@ -6,17 +6,28 @@
     - ../group_vars/all.yml
 
   tasks:
-    - name: Install python3-pip and ipmitool
+    # Use distro python3-libvirt + a dedicated venv (system-site-packages) so we do
+    # not build libvirt-python against the controller's project venv (e.g. Python 3.14).
+    - name: Install VirtualBMC OS packages
       ansible.builtin.dnf:
         name:
+          - python3
           - python3-pip
+          - python3-libvirt
           - ipmitool
+          - libvirt-devel
+          - python3-devel
+          - gcc
+          - pkgconf-pkg-config
         state: present
 
-    - name: Install virtualbmc
+    - name: Install virtualbmc into dedicated virtualenv
       ansible.builtin.pip:
         name: virtualbmc
         state: present
+        virtualenv: "{{ vbmc_install_dir }}"
+        virtualenv_command: /usr/bin/python3 -m venv
+        virtualenv_site_packages: true
 
     - name: Create VirtualBMC directories
       ansible.builtin.file:
@@ -49,7 +60,7 @@
           [Service]
           Type=simple
           Environment=VIRTUALBMC_CONFIG={{ vbmc_config_dir }}/virtualbmc.conf
-          ExecStart=/usr/local/bin/vbmcd --foreground
+          ExecStart={{ vbmc_install_dir }}/bin/vbmcd --foreground
           Restart=on-failure
           RestartSec=5
 
@@ -79,7 +90,7 @@
       ansible.builtin.meta: flush_handlers
 
     - name: Wait for vbmcd control socket
-      ansible.builtin.command: vbmc list
+      ansible.builtin.command: "{{ vbmc_install_dir }}/bin/vbmc list"
       environment:
         VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
       register: vbmc_list_ready
@@ -141,7 +152,7 @@
         label: "{{ item.item.name }}"
 
     - name: List configured VirtualBMC instances
-      ansible.builtin.command: vbmc list
+      ansible.builtin.command: "{{ vbmc_install_dir }}/bin/vbmc list"
       environment:
         VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
       register: vbmc_list
@@ -149,7 +160,7 @@
 
     - name: Add VirtualBMC instance when missing
       ansible.builtin.command: >
-        vbmc add {{ item.name }}
+        {{ vbmc_install_dir }}/bin/vbmc add {{ item.name }}
         --address {{ vbmc_listen_ip }}
         --port {{ item.port }}
         --username {{ vbmc_username }}
@@ -164,7 +175,7 @@
         label: "{{ item.name }}:{{ item.port }}"
 
     - name: Start each VirtualBMC instance
-      ansible.builtin.command: vbmc start {{ item.name }}
+      ansible.builtin.command: "{{ vbmc_install_dir }}/bin/vbmc start {{ item.name }}"
       environment:
         VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
       loop: "{{ vbmc_domains_present }}"
@@ -177,7 +188,7 @@
         label: "{{ item.name }}"
 
     - name: Refresh VirtualBMC list
-      ansible.builtin.command: vbmc list
+      ansible.builtin.command: "{{ vbmc_install_dir }}/bin/vbmc list"
       environment:
         VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
       register: vbmc_list_final

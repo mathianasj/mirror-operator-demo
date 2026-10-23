@@ -206,6 +206,7 @@ Runs beside sushy: Redfish for power/boot/media, VirtualBMC for IPMI including S
 | `vbmc_libvirt_uri` | `qemu:///system` |
 | `vbmc_username` | `admin` |
 | `vbmc_password` | `"changeme"` |
+| `vbmc_install_dir` | `/opt/virtualbmc` (venv with system `python3-libvirt`) |
 | `vbmc_domains` | `bare-vm:6230`, `sno-vm:6231` |
 
 Config from [`templates/virtualbmc.conf.j2`](templates/virtualbmc.conf.j2). Example SOL session:

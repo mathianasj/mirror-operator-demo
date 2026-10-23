@@ -157,6 +157,7 @@ vbmc_listen_ip: "{{ isolated_network_gateway }}"
 vbmc_libvirt_uri: "qemu:///system"
 vbmc_username: admin
 vbmc_password: "changeme"  # Override with ansible-vault or -e
+vbmc_install_dir: /opt/virtualbmc
 vbmc_config_dir: /etc/virtualbmc
 vbmc_state_dir: /var/lib/virtualbmc
 vbmc_log_dir: /var/log/virtualbmc
