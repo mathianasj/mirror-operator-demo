@@ -15,6 +15,7 @@
           - python3-pip
           - python3-libvirt
           - ipmitool
+          - firewalld
           - libvirt-devel
           - python3-devel
           - gcc
@@ -92,14 +93,36 @@
           WantedBy=multi-user.target
       notify: Restart vbmcd
 
-    - name: Open firewall UDP ports for VirtualBMC on libvirt zone
-      ansible.posix.firewalld:
-        port: "{{ item.port }}/udp"
-        zone: libvirt
-        permanent: true
-        immediate: true
-        state: enabled
+    # Use firewall-cmd instead of ansible.posix.firewalld — that module needs
+    # python3-firewall on the interpreter, which is often missing on minimal hosts.
+    - name: Open firewall UDP ports for VirtualBMC on libvirt zone (permanent)
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - --zone=libvirt
+          - --add-port={{ item.port }}/udp
       loop: "{{ vbmc_domains }}"
+      register: vbmc_fw_permanent
+      changed_when: "'success' in (vbmc_fw_permanent.stdout | default('') | lower)"
+      failed_when:
+        - vbmc_fw_permanent.rc != 0
+        - "'ALREADY_ENABLED' not in ((vbmc_fw_permanent.stdout | default('')) ~ (vbmc_fw_permanent.stderr | default('')))"
+      loop_control:
+        label: "{{ item.name }}:{{ item.port }}/udp"
+
+    - name: Open firewall UDP ports for VirtualBMC on libvirt zone (runtime)
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --zone=libvirt
+          - --add-port={{ item.port }}/udp
+      loop: "{{ vbmc_domains }}"
+      register: vbmc_fw_runtime
+      changed_when: "'success' in (vbmc_fw_runtime.stdout | default('') | lower)"
+      failed_when:
+        - vbmc_fw_runtime.rc != 0
+        - "'ALREADY_ENABLED' not in ((vbmc_fw_runtime.stdout | default('')) ~ (vbmc_fw_runtime.stderr | default('')))"
       loop_control:
         label: "{{ item.name }}:{{ item.port }}/udp"
 
