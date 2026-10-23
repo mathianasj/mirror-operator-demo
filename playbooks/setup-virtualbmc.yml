@@ -12,8 +12,9 @@
     - ../group_vars/all.yml
 
   tasks:
-    # Use distro python3-libvirt + a dedicated venv (system-site-packages) so we do
-    # not build libvirt-python against the controller's project venv (e.g. Python 3.14).
+    # Use distro python3-libvirt + a dedicated venv (system-site-packages).
+    # Do not pull libvirt-devel/gcc — RHEL needs CRB for those, and we do not
+    # build libvirt-python from source when the distro binding is present.
     - name: Install VirtualBMC OS packages
       ansible.builtin.dnf:
         name:
@@ -21,10 +22,6 @@
           - python3-pip
           - python3-libvirt
           - ipmitool
-          - libvirt-devel
-          - python3-devel
-          - gcc
-          - pkgconf-pkg-config
         state: present
 
     # Avoid ansible.builtin.pip here: with ansible_python_interpreter=/usr/bin/python3
@@ -55,9 +52,24 @@
 
     - name: Install virtualbmc into dedicated virtualenv
       ansible.builtin.command:
-        cmd: "{{ vbmc_install_dir }}/bin/pip install --upgrade virtualbmc"
+        # --no-deps avoids pip trying to build libvirt-python; use distro
+        # python3-libvirt via system-site-packages instead.
+        cmd: >-
+          {{ vbmc_install_dir }}/bin/pip install --upgrade
+          --no-deps virtualbmc
       register: vbmc_pip_install
       changed_when: "'Successfully installed' in vbmc_pip_install.stdout"
+
+    - name: Install VirtualBMC Python dependencies (except libvirt-python)
+      ansible.builtin.command:
+        cmd: >-
+          {{ vbmc_install_dir }}/bin/pip install --upgrade
+          'pbr!=2.1.0,>=2.0.0'
+          'pyghmi>=1.2.0'
+          'cliff!=2.9.0,>=2.8.0'
+          'pyzmq>=19.0.0'
+      register: vbmc_pip_deps
+      changed_when: "'Successfully installed' in vbmc_pip_deps.stdout"
 
     - name: Create VirtualBMC directories
       ansible.builtin.file:
