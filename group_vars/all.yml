@@ -152,6 +152,20 @@ sushy_emulator_username: admin
 sushy_emulator_password: "changeme"  # Override with ansible-vault or -e; max 72 chars (bcrypt)
 sushy_emulator_auth_file: /etc/sushy/htpasswd
 
+# VirtualBMC / IPMI SOL (alongside Redfish; one UDP port per libvirt domain)
+vbmc_listen_ip: "{{ isolated_network_gateway }}"
+vbmc_libvirt_uri: "qemu:///system"
+vbmc_username: admin
+vbmc_password: "changeme"  # Override with ansible-vault or -e
+vbmc_config_dir: /etc/virtualbmc
+vbmc_state_dir: /var/lib/virtualbmc
+vbmc_log_dir: /var/log/virtualbmc
+vbmc_domains:
+  - name: "{{ bare_vm_name }}"
+    port: 6230
+  - name: "{{ sno_vm_name }}"
+    port: 6231
+
 # OpenShift / ODF
 ocp_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(lookup('env', 'HOME') ~ '/.kube/config', true) }}"
 ocp_verify_ssl: false  # sandbox/lab clusters often use self-signed chains; set true for production

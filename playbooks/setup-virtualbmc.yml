@@ -1,0 +1,250 @@
+---
+- name: Set up VirtualBMC for IPMI / Serial-over-LAN
+  hosts: hypervisors
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Install python3-pip and ipmitool
+      ansible.builtin.dnf:
+        name:
+          - python3-pip
+          - ipmitool
+        state: present
+
+    - name: Install virtualbmc
+      ansible.builtin.pip:
+        name: virtualbmc
+        state: present
+
+    - name: Create VirtualBMC directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ vbmc_config_dir }}"
+        - "{{ vbmc_state_dir }}"
+        - "{{ vbmc_log_dir }}"
+
+    - name: Deploy VirtualBMC config
+      ansible.builtin.template:
+        src: ../templates/virtualbmc.conf.j2
+        dest: "{{ vbmc_config_dir }}/virtualbmc.conf"
+        mode: "0644"
+      notify: Restart vbmcd
+
+    - name: Create systemd service for vbmcd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vbmcd.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VirtualBMC IPMI emulator
+          After=libvirtd.service network-online.target
+          Requires=libvirtd.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          Environment=VIRTUALBMC_CONFIG={{ vbmc_config_dir }}/virtualbmc.conf
+          ExecStart=/usr/local/bin/vbmcd --foreground
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart vbmcd
+
+    - name: Open firewall UDP ports for VirtualBMC on libvirt zone
+      ansible.posix.firewalld:
+        port: "{{ item.port }}/udp"
+        zone: libvirt
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ vbmc_domains }}"
+      loop_control:
+        label: "{{ item.name }}:{{ item.port }}/udp"
+
+    - name: Enable and start vbmcd
+      ansible.builtin.systemd:
+        name: vbmcd
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Flush handlers so vbmcd is ready before vbmc client calls
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for vbmcd control socket
+      ansible.builtin.command: vbmc list
+      environment:
+        VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
+      register: vbmc_list_ready
+      retries: 10
+      delay: 2
+      until: vbmc_list_ready.rc == 0
+      changed_when: false
+
+    - name: Check whether each managed domain exists in libvirt
+      ansible.builtin.command: virsh dominfo {{ item.name }}
+      loop: "{{ vbmc_domains }}"
+      register: vbmc_domain_exists
+      failed_when: false
+      changed_when: false
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Set domains present in libvirt
+      ansible.builtin.set_fact:
+        vbmc_domains_present: >-
+          {{
+            vbmc_domain_exists.results
+            | selectattr('rc', 'equalto', 0)
+            | map(attribute='item')
+            | list
+          }}
+        vbmc_domains_missing: >-
+          {{
+            vbmc_domain_exists.results
+            | rejectattr('rc', 'equalto', 0)
+            | map(attribute='item')
+            | map(attribute='name')
+            | list
+          }}
+
+    - name: Warn when configured VirtualBMC domains are missing
+      ansible.builtin.debug:
+        msg: >-
+          Skipping VirtualBMC for missing libvirt domains:
+          {{ vbmc_domains_missing | join(', ') }}
+      when: vbmc_domains_missing | length > 0
+
+    - name: Check for existing PTY serial console on each domain
+      ansible.builtin.shell: >
+        virsh dumpxml {{ item.name }} | grep -E '<serial type=.pty'
+      loop: "{{ vbmc_domains_present }}"
+      register: vbmc_serial_check
+      failed_when: false
+      changed_when: false
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Add PTY serial console for IPMI SOL
+      ansible.builtin.command: >
+        virt-xml {{ item.item.name }} --add-device --serial pty
+      loop: "{{ vbmc_serial_check.results }}"
+      when: item.rc != 0
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: List configured VirtualBMC instances
+      ansible.builtin.command: vbmc list
+      environment:
+        VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
+      register: vbmc_list
+      changed_when: false
+
+    - name: Add VirtualBMC instance when missing
+      ansible.builtin.command: >
+        vbmc add {{ item.name }}
+        --address {{ vbmc_listen_ip }}
+        --port {{ item.port }}
+        --username {{ vbmc_username }}
+        --password {{ vbmc_password }}
+        --libvirt-uri {{ vbmc_libvirt_uri }}
+      environment:
+        VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
+      loop: "{{ vbmc_domains_present }}"
+      when: item.name not in vbmc_list.stdout
+      no_log: true
+      loop_control:
+        label: "{{ item.name }}:{{ item.port }}"
+
+    - name: Start each VirtualBMC instance
+      ansible.builtin.command: vbmc start {{ item.name }}
+      environment:
+        VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
+      loop: "{{ vbmc_domains_present }}"
+      register: vbmc_start
+      changed_when: vbmc_start.rc == 0
+      failed_when:
+        - vbmc_start.rc != 0
+        - "'already running' not in ((vbmc_start.stderr | default('')) ~ (vbmc_start.stdout | default('')))"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Refresh VirtualBMC list
+      ansible.builtin.command: vbmc list
+      environment:
+        VIRTUALBMC_CONFIG: "{{ vbmc_config_dir }}/virtualbmc.conf"
+      register: vbmc_list_final
+      changed_when: false
+
+    - name: Probe IPMI power status for each VirtualBMC
+      ansible.builtin.command: >
+        ipmitool -I lanplus -C 3
+        -H {{ vbmc_listen_ip }}
+        -p {{ item.port }}
+        -U {{ vbmc_username }}
+        -P {{ vbmc_password }}
+        power status
+      loop: "{{ vbmc_domains_present }}"
+      register: vbmc_power_probe
+      when: vbmc_domains_present | length > 0
+      changed_when: false
+      retries: 5
+      delay: 2
+      until: vbmc_power_probe.rc == 0
+      no_log: true
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build IPMI endpoint summary lines
+      ansible.builtin.set_fact:
+        vbmc_endpoint_lines: >-
+          {{
+            vbmc_endpoint_lines | default([]) + [
+              item.name ~ ': ipmitool -I lanplus -C 3 -H ' ~ vbmc_listen_ip
+              ~ ' -p ' ~ (item.port | string)
+              ~ ' -U ' ~ vbmc_username
+              ~ ' -P <password> power status'
+            ]
+          }}
+      loop: "{{ vbmc_domains_present }}"
+      when: vbmc_domains_present | length > 0
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display VirtualBMC / IPMI SOL summary
+      ansible.builtin.debug:
+        msg: "{{ vbmc_summary_msg }}"
+      vars:
+        vbmc_summary_msg: >-
+          {{
+            ['VirtualBMC list:']
+            + (vbmc_list_final.stdout_lines | default([]))
+            + ['', 'IPMI endpoints (power / boot / SOL):']
+            + (vbmc_endpoint_lines | default(['(no domains present)']))
+            + (
+                [
+                  '',
+                  'SOL activate (disconnect virsh console first); exit with Enter then ~. :',
+                  'ipmitool -I lanplus -C 3 -H ' ~ vbmc_listen_ip
+                  ~ ' -p ' ~ (vbmc_domains_present[0].port | string)
+                  ~ ' -U ' ~ vbmc_username
+                  ~ ' -P <password> sol activate'
+                ]
+                if (vbmc_domains_present | length > 0)
+                else []
+              )
+          }}
+
+  handlers:
+    - name: Restart vbmcd
+      ansible.builtin.systemd:
+        name: vbmcd
+        state: restarted
+        daemon_reload: true

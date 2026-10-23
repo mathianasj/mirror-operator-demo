@@ -1,6 +1,6 @@
 # Mirror Operator Demo
 
-Ansible automation for a KVM hypervisor lab on AWS bare metal. The top-level playbook provisions an EC2 host, configures KVM/GNOME/VNC, creates an isolated libvirt network, and deploys a RHEL 9 mirror workstation plus demo VMs with Redfish simulation.
+Ansible automation for a KVM hypervisor lab on AWS bare metal. The top-level playbook provisions an EC2 host, configures KVM/GNOME/VNC, creates an isolated libvirt network, and deploys a RHEL 9 mirror workstation plus demo VMs with Redfish (sushy) and IPMI SOL (VirtualBMC) simulation.
 
 After the hypervisor lab, root [`site.yml`](site.yml) imports [`playbooks/openshift/site.yml`](playbooks/openshift/site.yml) as a single sub-playbook (same file you can run alone for cluster-only work).
 
@@ -35,17 +35,18 @@ Ansible reads [`ansible.cfg`](ansible.cfg): inventory [`inventory/hosts.yml`](in
 7. [`playbooks/create-bare-vm.yml`](playbooks/create-bare-vm.yml) — bare VM with extra disk
 8. [`playbooks/create-sno-vm.yml`](playbooks/create-sno-vm.yml) — SNO demo VM
 9. [`playbooks/setup-redfish.yml`](playbooks/setup-redfish.yml) — sushy Redfish emulator
+10. [`playbooks/setup-virtualbmc.yml`](playbooks/setup-virtualbmc.yml) — VirtualBMC IPMI / SOL
 
 **OpenShift** (via [`playbooks/openshift/site.yml`](playbooks/openshift/site.yml))
 
-10. [`connect-cluster.yml`](playbooks/openshift/connect-cluster.yml) — kubeconfig, version/channel facts
-11. [`configure-cluster-proxy.yml`](playbooks/openshift/configure-cluster-proxy.yml) — trust bundle + proxy URLs, then [`enable-proxy-mitm.yml`](playbooks/enable-proxy-mitm.yml)
-12. [`configure-cert-manager-issuer.yml`](playbooks/openshift/configure-cert-manager-issuer.yml) — ClusterIssuer
-13. [`scale-worker-machineset.yml`](playbooks/openshift/scale-worker-machineset.yml) — worker MachineSet replicas
-14. [`create-gp3-high-perf-sc.yml`](playbooks/openshift/create-gp3-high-perf-sc.yml) — high-performance `StorageClass`
-15. [`install-odf-noobaa.yml`](playbooks/openshift/install-odf-noobaa.yml) — ODF / NooBaa operator install
-16. [`configure-noobaa-backing-store.yml`](playbooks/openshift/configure-noobaa-backing-store.yml) — NooBaa backing store
-17. [`validate-odf-noobaa.yml`](playbooks/openshift/validate-odf-noobaa.yml) — health checks
+11. [`connect-cluster.yml`](playbooks/openshift/connect-cluster.yml) — kubeconfig, version/channel facts
+12. [`configure-cluster-proxy.yml`](playbooks/openshift/configure-cluster-proxy.yml) — trust bundle + proxy URLs, then [`enable-proxy-mitm.yml`](playbooks/enable-proxy-mitm.yml)
+13. [`configure-cert-manager-issuer.yml`](playbooks/openshift/configure-cert-manager-issuer.yml) — ClusterIssuer
+14. [`scale-worker-machineset.yml`](playbooks/openshift/scale-worker-machineset.yml) — worker MachineSet replicas
+15. [`create-gp3-high-perf-sc.yml`](playbooks/openshift/create-gp3-high-perf-sc.yml) — high-performance `StorageClass`
+16. [`install-odf-noobaa.yml`](playbooks/openshift/install-odf-noobaa.yml) — ODF / NooBaa operator install
+17. [`configure-noobaa-backing-store.yml`](playbooks/openshift/configure-noobaa-backing-store.yml) — NooBaa backing store
+18. [`validate-odf-noobaa.yml`](playbooks/openshift/validate-odf-noobaa.yml) — health checks
 
 All configuration flows from [`group_vars/all.yml`](group_vars/all.yml), inventory, CLI extra-vars (`-e`), and external prerequisites. There is no playbook-level `vars:` block in `site.yml`.
 
@@ -194,6 +195,26 @@ Kickstart is rendered from [`templates/rhel-kickstart.cfg.j2`](templates/rhel-ki
 | `sushy_emulator_ssl_key` | `/etc/sushy/tls/key.pem` |
 
 Config from [`templates/sushy-emulator.conf.j2`](templates/sushy-emulator.conf.j2). A self-signed TLS certificate is generated on first run.
+
+### VirtualBMC / IPMI SOL (`setup-virtualbmc.yml`)
+
+Runs beside sushy: Redfish for power/boot/media, VirtualBMC for IPMI including Serial-over-LAN. Each libvirt domain gets its own UDP IPMI port on the isolated gateway. Ensures a PTY serial console exists on each managed domain (also added at create time for bare/SNO VMs).
+
+| Variable | Default |
+|----------|---------|
+| `vbmc_listen_ip` | `{{ isolated_network_gateway }}` (`192.168.100.1`) |
+| `vbmc_libvirt_uri` | `qemu:///system` |
+| `vbmc_username` | `admin` |
+| `vbmc_password` | `"changeme"` |
+| `vbmc_domains` | `bare-vm:6230`, `sno-vm:6231` |
+
+Config from [`templates/virtualbmc.conf.j2`](templates/virtualbmc.conf.j2). Example SOL session:
+
+```bash
+ipmitool -I lanplus -C 3 -H 192.168.100.1 -p 6230 -U admin -P changeme sol activate
+```
+
+Disconnect any `virsh console` session first; exit SOL with Enter then `~.`.
 
 ### Corporate proxy and PKI (`setup-proxy.yml`)
 

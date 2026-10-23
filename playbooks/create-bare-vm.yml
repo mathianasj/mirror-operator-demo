@@ -23,6 +23,7 @@
         --boot uefi,hd,cdrom
         --os-variant generic
         --graphics vnc,listen=0.0.0.0
+        --console pty,target_type=serial
         --noautoconsole
         --import
       when: vm_exists.rc != 0

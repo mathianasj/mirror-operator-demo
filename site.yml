@@ -26,5 +26,8 @@
 - name: Set up Redfish simulation
   ansible.builtin.import_playbook: playbooks/setup-redfish.yml
 
+- name: Set up VirtualBMC for IPMI SOL
+  ansible.builtin.import_playbook: playbooks/setup-virtualbmc.yml
+
 - name: OpenShift post-install
   ansible.builtin.import_playbook: playbooks/openshift/site.yml

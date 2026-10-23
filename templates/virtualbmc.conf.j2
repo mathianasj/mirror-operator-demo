@@ -1,0 +1,11 @@
+[default]
+show_passwords = false
+config_dir = {{ vbmc_state_dir }}
+pid_file = {{ vbmc_state_dir }}/vbmcd.pid
+
+[log]
+debug = false
+logfile = {{ vbmc_log_dir }}/vbmcd.log
+
+[ipmi]
+session_timeout = 60

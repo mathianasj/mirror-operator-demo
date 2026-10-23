@@ -23,6 +23,7 @@
         --boot uefi,hd,cdrom
         --os-variant generic
         --graphics vnc,listen=0.0.0.0
+        --console pty,target_type=serial
         --noautoconsole
         --import
       when: vm_exists.rc != 0
@@ -55,8 +56,9 @@
       register: sno_vm_uuid
       changed_when: false
 
-    - name: Display Redfish endpoint info
+    - name: Display Redfish / IPMI endpoint info
       ansible.builtin.debug:
         msg: |
           SNO VM UUID: {{ sno_vm_uuid.stdout }}
           Redfish System: https://{{ sushy_emulator_listen_ip }}:{{ sushy_emulator_port }}/redfish/v1/Systems/{{ sno_vm_uuid.stdout }}
+          IPMI/SOL: ipmitool -I lanplus -C 3 -H {{ vbmc_listen_ip }} -p {{ (vbmc_domains | selectattr('name', 'equalto', sno_vm_name) | map(attribute='port') | first) }} -U {{ vbmc_username }} -P <password> sol activate
