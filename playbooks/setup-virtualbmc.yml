@@ -15,7 +15,6 @@
           - python3-pip
           - python3-libvirt
           - ipmitool
-          - firewalld
           - libvirt-devel
           - python3-devel
           - gcc
@@ -93,11 +92,13 @@
           WantedBy=multi-user.target
       notify: Restart vbmcd
 
-    - name: Enable and start firewalld
-      ansible.builtin.systemd:
-        name: firewalld
-        enabled: true
-        state: started
+    # Only open ports when firewalld is already active. Do not start it — that
+    # would begin filtering traffic that was previously unrestricted.
+    - name: Check whether firewalld is running
+      ansible.builtin.command: systemctl is-active firewalld
+      register: vbmc_firewalld_active
+      changed_when: false
+      failed_when: false
 
     # Use firewall-cmd instead of ansible.posix.firewalld — that module needs
     # python3-firewall on the interpreter, which is often missing on minimal hosts.
@@ -109,6 +110,7 @@
           - --zone=libvirt
           - --add-port={{ item.port }}/udp
       loop: "{{ vbmc_domains }}"
+      when: vbmc_firewalld_active.rc == 0
       register: vbmc_fw_permanent
       changed_when: "'success' in (vbmc_fw_permanent.stdout | default('') | lower)"
       failed_when:
@@ -124,6 +126,7 @@
           - --zone=libvirt
           - --add-port={{ item.port }}/udp
       loop: "{{ vbmc_domains }}"
+      when: vbmc_firewalld_active.rc == 0
       register: vbmc_fw_runtime
       changed_when: "'success' in (vbmc_fw_runtime.stdout | default('') | lower)"
       failed_when:
@@ -131,6 +134,13 @@
         - "'ALREADY_ENABLED' not in ((vbmc_fw_runtime.stdout | default('')) ~ (vbmc_fw_runtime.stderr | default('')))"
       loop_control:
         label: "{{ item.name }}:{{ item.port }}/udp"
+
+    - name: Note when VirtualBMC firewall ports were skipped
+      ansible.builtin.debug:
+        msg: >-
+          firewalld is not running; skipping UDP port opens for VirtualBMC
+          (nothing is filtering traffic).
+      when: vbmc_firewalld_active.rc != 0
 
     - name: Enable and start vbmcd
       ansible.builtin.systemd:
