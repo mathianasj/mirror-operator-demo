@@ -93,6 +93,12 @@
           WantedBy=multi-user.target
       notify: Restart vbmcd
 
+    - name: Enable and start firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
     # Use firewall-cmd instead of ansible.posix.firewalld — that module needs
     # python3-firewall on the interpreter, which is often missing on minimal hosts.
     - name: Open firewall UDP ports for VirtualBMC on libvirt zone (permanent)
