@@ -5,6 +5,9 @@
 - name: Set up VirtualBMC for IPMI / Serial-over-LAN
   hosts: hypervisors
   become: true
+  vars:
+    # Distro modules (dnf, systemd) on the EC2 hypervisor
+    ansible_python_interpreter: /usr/bin/python3
   vars_files:
     - ../group_vars/all.yml
 
