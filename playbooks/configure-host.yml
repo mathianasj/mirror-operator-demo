@@ -21,6 +21,8 @@
           - qemu-kvm
           - libvirt
           - libvirt-client
+          - libvirt-daemon-config-network
+          - libvirt-daemon-driver-network
           - virt-install
           - virt-viewer
           - guestfs-tools
@@ -34,11 +36,26 @@
           - cockpit-storaged
         state: present
 
-    - name: Enable and start libvirtd
-      ansible.builtin.systemd:
-        name: libvirtd
-        enabled: true
-        state: started
+    # RHEL 9 modular libvirt: enable the full driver set (RH recommended loop).
+    - name: Enable modular libvirt daemons and sockets
+      ansible.builtin.shell: |
+        set -e
+        for drv in qemu interface network nodedev nwfilter secret storage; do
+          systemctl unmask virt${drv}d.service virt${drv}d.socket virt${drv}d-ro.socket virt${drv}d-admin.socket || true
+          systemctl enable virt${drv}d.service virt${drv}d.socket virt${drv}d-ro.socket virt${drv}d-admin.socket || true
+          systemctl start virt${drv}d.socket virt${drv}d-ro.socket virt${drv}d-admin.socket || true
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Verify libvirt responds
+      ansible.builtin.command: virsh list --all
+      register: virsh_check
+      changed_when: false
+      retries: 5
+      delay: 2
+      until: virsh_check.rc == 0
 
     - name: Enable and start cockpit
       ansible.builtin.systemd:
