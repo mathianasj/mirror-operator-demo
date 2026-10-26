@@ -35,11 +35,12 @@
       delay: 2
       until: net_list_probe.rc == 0
 
+    # lookup('file') runs on the control node; ship default NAT XML in-repo like isolated.
     - name: Ensure default NAT network is defined
       community.libvirt.virt_net:
         name: default
         command: define
-        xml: "{{ lookup('file', '/usr/share/libvirt/networks/default.xml') }}"
+        xml: "{{ lookup('template', playbook_dir + '/../templates/default-network.xml.j2') }}"
       failed_when: false
 
     - name: Ensure default NAT network is active
