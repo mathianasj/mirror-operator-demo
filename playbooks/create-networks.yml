@@ -2,10 +2,46 @@
 - name: Create libvirt networks
   hosts: hypervisors
   become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
   vars_files:
     - ../group_vars/all.yml
 
   tasks:
+    - name: Install libvirt network config package
+      ansible.builtin.dnf:
+        name:
+          - libvirt-daemon-config-network
+          - libvirt-daemon-driver-network
+        state: present
+
+    # Modular libvirt stores/starts networks via virtnetworkd, not libvirtd alone.
+    - name: Enable and start virtnetworkd
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - virtnetworkd.socket
+        - virtnetworkd.service
+      failed_when: false
+
+    - name: Wait until virsh can list networks
+      ansible.builtin.command: virsh net-list --all
+      register: net_list_probe
+      changed_when: false
+      retries: 10
+      delay: 2
+      until: net_list_probe.rc == 0
+
+    - name: Ensure default NAT network is defined
+      community.libvirt.virt_net:
+        name: default
+        command: define
+        xml: "{{ lookup('file', '/usr/share/libvirt/networks/default.xml') }}"
+      failed_when: false
+
     - name: Ensure default NAT network is active
       community.libvirt.virt_net:
         name: default
@@ -43,6 +79,18 @@
       community.libvirt.virt_net:
         name: "{{ isolated_network_name }}"
         autostart: true
+
+    # Bridge recreate drops BMC alias IPs; re-run oneshot if setup-bmc already installed it.
+    - name: Check for BMC address alias unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/bmc-addresses.service
+      register: bmc_addresses_unit
+
+    - name: Re-apply BMC address aliases after isolated network recreate
+      ansible.builtin.systemd:
+        name: bmc-addresses
+        state: restarted
+      when: bmc_addresses_unit.stat.exists
 
     - name: Verify networks
       ansible.builtin.command: virsh net-list --all

@@ -263,12 +263,24 @@
         dest: /etc/systemd/system/bmc-addresses.service
         mode: "0644"
 
-    - name: Enable and run BMC address aliases
+    # oneshot RemainAfterExit=yes: "started" is a no-op when already active, so
+    # always restart after network recreate or script updates.
+    - name: Enable and (re)apply BMC address aliases
       ansible.builtin.systemd:
         name: bmc-addresses
         enabled: true
-        state: started
+        state: restarted
         daemon_reload: true
+
+    - name: Verify BMC IPs are present on {{ isolated_network_bridge }}
+      ansible.builtin.command: ip -4 addr show dev {{ isolated_network_bridge }}
+      register: bmc_bridge_addrs
+      changed_when: false
+      failed_when: >-
+        bmc_bridge_addrs.rc != 0 or
+        (bmc_nodes | map(attribute='bmc_ip') | list | difference(
+          bmc_bridge_addrs.stdout | regex_findall('inet ([0-9.]+)/')
+        ) | length) > 0
 
     - name: Check if shared BMC TLS certificate exists
       ansible.builtin.stat:
@@ -392,6 +404,17 @@
         enabled: true
         state: restarted
         daemon_reload: true
+      loop: "{{ bmc_nodes_ready | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait until per-node sushy-emulator is active
+      ansible.builtin.systemd:
+        name: "sushy-emulator@{{ item.name }}"
+      register: sushy_unit_status
+      until: sushy_unit_status.status.ActiveState | default('') == 'active'
+      retries: 15
+      delay: 2
       loop: "{{ bmc_nodes_ready | default([]) }}"
       loop_control:
         label: "{{ item.name }}"
@@ -542,19 +565,49 @@
         label: "{{ item.name }}"
 
     - name: Wait for per-node Redfish root
-      ansible.builtin.command: >
-        curl -sk -u {{ bmc_username }}:{{ bmc_password }}
-        -o /dev/null -w '%{http_code}'
-        https://{{ item.bmc_ip }}:{{ bmc_redfish_port }}/redfish/v1
-      loop: "{{ bmc_nodes_ready | default([]) }}"
-      register: redfish_check
-      retries: 10
-      delay: 3
-      until: redfish_check.stdout == "200"
-      changed_when: false
-      no_log: true
-      loop_control:
-        label: "{{ item.name }}"
+      block:
+        - name: Probe Redfish root on each BMC IP
+          ansible.builtin.uri:
+            url: "https://{{ item.bmc_ip }}:{{ bmc_redfish_port }}/redfish/v1"
+            url_username: "{{ bmc_username }}"
+            url_password: "{{ bmc_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            status_code: [200]
+            return_content: false
+          loop: "{{ bmc_nodes_ready | default([]) }}"
+          register: redfish_check
+          retries: 20
+          delay: 3
+          until: redfish_check is succeeded
+          no_log: true
+          loop_control:
+            label: "{{ item.name }}"
+      rescue:
+        - name: Collect Redfish diagnostics after wait failure
+          ansible.builtin.shell: |
+            set +e
+            echo "=== sushy-emulator@{{ item.name }} ==="
+            systemctl status "sushy-emulator@{{ item.name }}" --no-pager -l
+            journalctl -u "sushy-emulator@{{ item.name }}" -n 40 --no-pager
+            echo "=== {{ isolated_network_bridge }} addresses ==="
+            ip -4 addr show dev "{{ isolated_network_bridge }}"
+            echo "=== listeners on {{ bmc_redfish_port }}/tcp ==="
+            ss -lntp | grep -E ':{{ bmc_redfish_port }}\s' || true
+          args:
+            executable: /bin/bash
+          loop: "{{ bmc_nodes_ready | default([]) }}"
+          register: redfish_diag
+          changed_when: false
+          failed_when: false
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Fail with Redfish diagnostic output
+          ansible.builtin.fail:
+            msg: |
+              Redfish root not reachable on one or more BMC IPs.
+              {{ redfish_diag.results | map(attribute='stdout') | list | join('\n') }}
 
     - name: Probe IPMI power status on each BMC IP
       ansible.builtin.command: >
