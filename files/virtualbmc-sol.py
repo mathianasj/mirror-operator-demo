@@ -42,16 +42,17 @@ LOG = log.get_logger()
 CHARACTERS_PER_PACKET = 255
 PAYLOAD_SIZE = CHARACTERS_PER_PACKET + 4
 MAX_PENDING_INPUT = 4096
-MAX_OUTBUF = 256 * 1024
+MAX_OUTBUF = 1024 * 1024
 RECONNECT_INTERVAL = 1
 IDLE_TIMEOUT = 900
-POLL_INTERVAL = 0.02
+POLL_INTERVAL = 0.005
 SOL_INACTIVE = 0x10
-# One outstanding SOL data packet (protocol stop-and-wait). Soft-ACK so a
-# silent client cannot freeze the BMC loop; blasting without ACK kills ipmitool.
-ACK_RETRY_INTERVAL = 0.1
-ACK_MAX_RETRIES = 3
-TX_PACKETS_PER_POLL = 4
+# One outstanding SOL data packet (stop-and-wait). Never soft-ACK: advancing
+# sequence without a real client ACK desyncs ipmitool and kills the session.
+ACK_RETRY_INTERVAL = 0.05
+ACK_MAX_RETRIES = 200
+ACK_WAIT_SLICE = 0.01
+TX_PACKETS_PER_POLL = 8
 # Marker checked by setup-bmc.yml verify task.
 LAB_SOL_READER_THREAD = True
 LAB_SOL_BLOCKING_CONSOLE = True
@@ -109,7 +110,7 @@ class ServerConsole(console.ServerConsole):
                          else {'error': error})
 
     def _sendoutput(self, output, sendbreak=False):
-        """Send one SOL packet; wait for ACK without blocking the BMC loop."""
+        """Send one SOL packet; pump RX briefly so a local ipmitool can ACK."""
         self.myseq += 1
         self.myseq &= 0xf
         if self.myseq == 0:
@@ -127,16 +128,17 @@ class ServerConsole(console.ServerConsole):
         self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
         self._ack_retries_left = ACK_MAX_RETRIES
         self.send_payload(payload, retry=False, needskeepalive=needskeepalive)
-        # Brief pump so a prompt client ACK is seen without an Enter keystroke.
+        # Local lanplus RTT is tiny; wait long enough to clear awaitingack
+        # without requiring the client to hit Enter.
         try:
-            expiry = time.monotonic() + 0.03
+            expiry = time.monotonic() + 0.1
             while self.awaitingack and time.monotonic() < expiry:
-                self.wait_for_rsp(0.01)
+                self.wait_for_rsp(ACK_WAIT_SLICE)
         except Exception:
             pass
 
     def poll_tx(self):
-        """Pump IPMI RX, honor ACK window, soft-continue, drain pending TX."""
+        """Pump IPMI RX, honor ACK window, resend on timeout, drain TX."""
         if self.broken or not self.activated or not self.connected:
             return
         try:
@@ -146,7 +148,7 @@ class ServerConsole(console.ServerConsole):
         with self.outputlock:
             if self.awaitingack:
                 try:
-                    self.wait_for_rsp(0.02)
+                    self.wait_for_rsp(ACK_WAIT_SLICE)
                 except Exception:
                     pass
                 if not self.awaitingack:
@@ -164,10 +166,9 @@ class ServerConsole(console.ServerConsole):
                         self._print_error(str(exc))
                     return
                 else:
-                    # Soft-ACK: continue rather than freeze or kill the client
-                    # by flooding unacked sequence numbers.
-                    self.awaitingack = False
-                    self.lastpayload = None
+                    # Give up this SOL session cleanly rather than desync.
+                    self._print_error('SOL ACK timeout; closing session')
+                    return
             for _ in range(TX_PACKETS_PER_POLL):
                 if self.awaitingack or not self.pendingoutput:
                     break
@@ -306,8 +307,15 @@ class LibvirtConsole(object):
             LOG.info('SOL console reader attached for %s', self.domain_name)
 
             while not self._stop.is_set():
+                with self._lock:
+                    room = MAX_OUTBUF - len(self._outbuf)
+                if room <= 0:
+                    # Backpressure: wait for SOL TX to drain instead of dropping
+                    # boot logs (drop made captures stall mid-kernel forever).
+                    time.sleep(0.01)
+                    continue
                 try:
-                    data = stream.recv(CHARACTERS_PER_PACKET)
+                    data = stream.recv(min(CHARACTERS_PER_PACKET, room))
                 except libvirt.libvirtError as exc:
                     if self._stop.is_set():
                         break
@@ -320,9 +328,6 @@ class LibvirtConsole(object):
                 with self._lock:
                     room = MAX_OUTBUF - len(self._outbuf)
                     if room <= 0:
-                        LOG.warning(
-                            'SOL output buffer full for %s; dropping',
-                            self.domain_name)
                         continue
                     self._outbuf += data[:room]
         except Exception as exc:
