@@ -86,11 +86,66 @@ class ServerConsole(console.ServerConsole):
         self.lasttextsize = 0
 
     def _got_sol_payload(self, payload):
-        if (not isinstance(payload, dict)
-                and not 4 <= len(payload) <= PAYLOAD_SIZE):
+        """Handle SOL ACK/input without nested ``_sendpendingoutput``.
+
+        Upstream clears ``awaitingack`` then immediately sends the next chunk
+        while the outer ``_sendoutput`` is still in its ACK wait loop. That
+        double-send desyncs ipmitool and stalls mid-printk (~Spectre). Drain
+        is left to ``send_data`` / ``poll_tx`` after the wait returns.
+        """
+        if isinstance(payload, dict):
+            self.activated = False
+            self._print_error(payload)
+            return
+        if not 4 <= len(payload) <= PAYLOAD_SIZE:
             return
         self.last_activity = time.monotonic()
-        super(ServerConsole, self)._got_sol_payload(payload)
+
+        newseq = payload[0] & 0b1111
+        ackseq = payload[1] & 0b1111
+        ackcount = payload[2]
+        nacked = payload[3] & 0b1000000
+        breakdetected = payload[3] & 0b10000
+        remdata = b''
+        remdatalen = 0
+        flag = 0
+        if not self.poweredon:
+            flag |= 0b1100000
+        if not self.activated:
+            flag |= 0b1010000
+        if newseq != 0:
+            if len(payload) > 4:
+                remdatalen = len(payload[4:])
+                remdata = bytes(payload[4:])
+            if newseq == self.remseq:
+                if remdatalen > self.lastsize:
+                    remdata = bytes(remdata[self.lastsize:])
+                else:
+                    remdata = b''
+            else:
+                self.remseq = newseq
+            self.lastsize = remdatalen
+            ackpayload = bytearray((0, self.remseq, remdatalen, flag))
+            try:
+                self.send_payload(ackpayload, retry=False)
+            except ipmi_exception.IpmiException:
+                self.close()
+                return
+            if remdata:
+                self.out_handler(remdata)
+        if self.myseq != 0 and ackseq == self.myseq:
+            self.awaitingack = False
+            if nacked and not breakdetected:
+                newtext = self.lastpayload[4 + ackcount:]
+                with self.outputlock:
+                    if (self.pendingoutput
+                            and not isinstance(self.pendingoutput[0], dict)):
+                        self.pendingoutput[0] = newtext + self.pendingoutput[0]
+                    else:
+                        self.pendingoutput = [newtext] + self.pendingoutput
+            # Intentionally do NOT call _sendpendingoutput() here.
+        elif ackseq != 0 and self.awaitingack and self.lastpayload is not None:
+            self.send_payload(payload=self.lastpayload)
 
     def _print_error(self, error):
         self.broken = True
@@ -99,17 +154,15 @@ class ServerConsole(console.ServerConsole):
                          else {'error': error})
 
     def poll_tx(self):
-        """Pump IPMI RX so ACKs are processed between libvirt drains.
-
-        TX itself uses upstream ``_sendoutput`` (blocking ACK wait). Holding
-        ``outputlock`` across ``wait_for_rsp`` deadlocks; do not do that here.
-        """
+        """Pump IPMI RX; start next SOL chunk only when not awaiting ACK."""
         if self.broken or not self.activated or not self.connected:
             return
         try:
             self.wait_for_rsp(0)
         except Exception:
             pass
+        if not self.awaitingack and self.pendingoutput:
+            self._sendpendingoutput()
 
     def send_payload(self, payload, payload_type=1, retry=True,
                      needskeepalive=False):
