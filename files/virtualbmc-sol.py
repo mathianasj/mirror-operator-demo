@@ -42,17 +42,18 @@ LOG = log.get_logger()
 CHARACTERS_PER_PACKET = 255
 PAYLOAD_SIZE = CHARACTERS_PER_PACKET + 4
 MAX_PENDING_INPUT = 4096
-MAX_OUTBUF = 1024 * 1024
+MAX_OUTBUF = 2 * 1024 * 1024
 RECONNECT_INTERVAL = 1
 IDLE_TIMEOUT = 900
 POLL_INTERVAL = 0.005
 SOL_INACTIVE = 0x10
-# One outstanding SOL data packet (stop-and-wait). Never soft-ACK: advancing
-# sequence without a real client ACK desyncs ipmitool and kills the session.
-ACK_RETRY_INTERVAL = 0.05
-ACK_MAX_RETRIES = 200
-ACK_WAIT_SLICE = 0.01
-TX_PACKETS_PER_POLL = 8
+# Upstream pyghmi blocks in _sendoutput until ACK. Do the same with shorter
+# slices for local lanplus. Never hold outputlock across wait_for_rsp — that
+# deadlocks (_got_sol_payload → _sendpendingoutput needs the same lock).
+ACK_WAIT_SLICE = 0.05
+ACK_RETRY_WAIT = 0.3
+ACK_MAX_RETRIES = 15
+TX_PACKETS_PER_POLL = 4
 # Marker checked by setup-bmc.yml verify task.
 LAB_SOL_READER_THREAD = True
 LAB_SOL_BLOCKING_CONSOLE = True
@@ -89,19 +90,13 @@ class ServerConsole(console.ServerConsole):
         self.maxoutcount = CHARACTERS_PER_PACKET
         self.lastpayload = None
         self.lasttextsize = 0
-        self._ack_deadline = 0.0
-        self._ack_retries_left = 0
 
     def _got_sol_payload(self, payload):
         if (not isinstance(payload, dict)
                 and not 4 <= len(payload) <= PAYLOAD_SIZE):
             return
         self.last_activity = time.monotonic()
-        was_awaiting = self.awaitingack
         super(ServerConsole, self)._got_sol_payload(payload)
-        if (was_awaiting and not self.awaitingack and not self.broken
-                and self.activated and self.pendingoutput):
-            self._sendpendingoutput()
 
     def _print_error(self, error):
         self.broken = True
@@ -110,7 +105,7 @@ class ServerConsole(console.ServerConsole):
                          else {'error': error})
 
     def _sendoutput(self, output, sendbreak=False):
-        """Send one SOL packet; pump RX briefly so a local ipmitool can ACK."""
+        """Send one SOL packet and wait for ACK (pyghmi-style, shorter waits)."""
         self.myseq += 1
         self.myseq &= 0xf
         if self.myseq == 0:
@@ -125,54 +120,43 @@ class ServerConsole(console.ServerConsole):
         needskeepalive = self.lasttextsize == 0
         self.lastpayload = payload
         self.awaitingack = True
-        self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
-        self._ack_retries_left = ACK_MAX_RETRIES
         self.send_payload(payload, retry=False, needskeepalive=needskeepalive)
-        # Local lanplus RTT is tiny; wait long enough to clear awaitingack
-        # without requiring the client to hit Enter.
-        try:
-            expiry = time.monotonic() + 0.1
-            while self.awaitingack and time.monotonic() < expiry:
-                self.wait_for_rsp(ACK_WAIT_SLICE)
-        except Exception:
-            pass
+        retries = ACK_MAX_RETRIES
+        while retries and self.awaitingack and self.activated and not self.broken:
+            expiry = time.monotonic() + ACK_RETRY_WAIT
+            while (self.awaitingack and self.activated and not self.broken
+                   and time.monotonic() < expiry):
+                try:
+                    self.wait_for_rsp(ACK_WAIT_SLICE)
+                except Exception:
+                    break
+            if self.awaitingack and self.activated and not self.broken:
+                try:
+                    self.send_payload(
+                        payload, retry=False, needskeepalive=needskeepalive)
+                except (ipmi_exception.IpmiException, OSError) as exc:
+                    self._print_error(str(exc))
+                    return
+            retries -= 1
+        if self.awaitingack:
+            self._print_error('SOL ACK timeout; closing session')
 
     def poll_tx(self):
-        """Pump IPMI RX, honor ACK window, resend on timeout, drain TX."""
+        """Pump IPMI RX and drain pending SOL TX. Do not hold outputlock here."""
         if self.broken or not self.activated or not self.connected:
             return
         try:
             self.wait_for_rsp(0)
         except Exception:
             pass
-        with self.outputlock:
-            if self.awaitingack:
-                try:
-                    self.wait_for_rsp(ACK_WAIT_SLICE)
-                except Exception:
-                    pass
-                if not self.awaitingack:
-                    pass
-                elif time.monotonic() < self._ack_deadline:
-                    return
-                elif self._ack_retries_left > 0:
-                    self._ack_retries_left -= 1
-                    self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
-                    try:
-                        self.send_payload(
-                            self.lastpayload, retry=False,
-                            needskeepalive=(self.lasttextsize == 0))
-                    except (ipmi_exception.IpmiException, OSError) as exc:
-                        self._print_error(str(exc))
-                    return
-                else:
-                    # Give up this SOL session cleanly rather than desync.
-                    self._print_error('SOL ACK timeout; closing session')
-                    return
-            for _ in range(TX_PACKETS_PER_POLL):
-                if self.awaitingack or not self.pendingoutput:
-                    break
-                self._sendpendingoutput()
+        if self.awaitingack:
+            return
+        for _ in range(TX_PACKETS_PER_POLL):
+            if self.awaitingack or self.broken or not self.activated:
+                break
+            if not self.pendingoutput:
+                break
+            self._sendpendingoutput()
 
     def send_payload(self, payload, payload_type=1, retry=True,
                      needskeepalive=False):
@@ -307,15 +291,8 @@ class LibvirtConsole(object):
             LOG.info('SOL console reader attached for %s', self.domain_name)
 
             while not self._stop.is_set():
-                with self._lock:
-                    room = MAX_OUTBUF - len(self._outbuf)
-                if room <= 0:
-                    # Backpressure: wait for SOL TX to drain instead of dropping
-                    # boot logs (drop made captures stall mid-kernel forever).
-                    time.sleep(0.01)
-                    continue
                 try:
-                    data = stream.recv(min(CHARACTERS_PER_PACKET, room))
+                    data = stream.recv(CHARACTERS_PER_PACKET)
                 except libvirt.libvirtError as exc:
                     if self._stop.is_set():
                         break
@@ -325,11 +302,16 @@ class LibvirtConsole(object):
                     break
                 if not data:
                     break
+                # Always read so qemu/guest console never blocks. If SOL TX is
+                # slow, drop oldest buffered bytes (ring) rather than stall boot.
                 with self._lock:
-                    room = MAX_OUTBUF - len(self._outbuf)
-                    if room <= 0:
-                        continue
-                    self._outbuf += data[:room]
+                    self._outbuf += data
+                    overflow = len(self._outbuf) - MAX_OUTBUF
+                    if overflow > 0:
+                        del self._outbuf[:overflow]
+                        LOG.warning(
+                            'SOL output buffer overrun for %s; dropped %s bytes',
+                            self.domain_name, overflow)
         except Exception as exc:
             LOG.warning('SOL console thread failed for %(domain)s: %(error)s',
                         {'domain': self.domain_name, 'error': exc})
