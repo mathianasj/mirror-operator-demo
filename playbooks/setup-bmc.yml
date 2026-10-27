@@ -306,6 +306,25 @@
       changed_when: "'patched' in vbmc_poll_patch.stdout"
       notify: Restart vbmcd
 
+    - name: Verify lab SOL streaming hooks are installed
+      ansible.builtin.command:
+        argv:
+          - "{{ vbmc_install_dir }}/bin/python"
+          - -c
+          - |
+            from pathlib import Path
+            import virtualbmc.sol as solmod
+            import virtualbmc.vbmc as vbmcmod
+            assert hasattr(solmod.ServerConsole, "poll_tx"), "sol.ServerConsole missing poll_tx"
+            src = Path(solmod.__file__).read_text()
+            assert "was_awaiting" in src, "sol.py missing ACK queue flush"
+            assert "poll_tx" in Path(vbmcmod.__file__).read_text(), (
+                "vbmc._poll_sol missing poll_tx hook"
+            )
+            print("ok", solmod.__file__, vbmcmod.__file__)
+      register: vbmc_sol_verify
+      changed_when: false
+
     - name: Create BMC directories
       ansible.builtin.file:
         path: "{{ item }}"

@@ -92,7 +92,15 @@ class ServerConsole(console.ServerConsole):
                 and not 4 <= len(payload) <= PAYLOAD_SIZE):
             return
         self.last_activity = time.monotonic()
+        was_awaiting = self.awaitingack
         super(ServerConsole, self)._got_sol_payload(payload)
+        # Upstream ServerConsole clears awaitingack on a matching ACK but does
+        # not continue the TX queue (client Console relied on blocking
+        # _sendoutput returning to the caller). Flush pending immediately so
+        # guest output keeps streaming without an Enter/CR pump.
+        if (was_awaiting and not self.awaitingack and not self.broken
+                and self.activated and self.pendingoutput):
+            self._sendpendingoutput()
 
     def _print_error(self, error):
         # ServerSession lacks the client keepalive state used by pyghmi's
@@ -127,9 +135,15 @@ class ServerConsole(console.ServerConsole):
         self.send_payload(payload, retry=False, needskeepalive=needskeepalive)
 
     def poll_tx(self):
-        """Retry unacked TX or flush the pending queue (BMC event-loop tick)."""
+        """Pump IPMI ACKs, retry unacked TX, or flush pending (BMC tick)."""
         if self.broken or not self.activated or not self.connected:
             return
+        # listen() already waits, but drain any ACK that arrived since then
+        # before deciding whether to retry or continue the queue.
+        try:
+            self.wait_for_rsp(0)
+        except Exception:
+            pass
         with self.outputlock:
             if self.awaitingack:
                 if time.monotonic() < self._ack_deadline:
