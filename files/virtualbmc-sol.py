@@ -20,9 +20,9 @@ Lab patch on top of upstream VirtualBMC master:
 - VIR_DOMAIN_CONSOLE_FORCE so Cockpit/virsh do not block SOL
 - stream event callbacks + output buffer (plain NONBLOCK recv often
   returns -2 forever on RHEL libvirt unless events are registered)
-- non-blocking SOL TX: pyghmi's _sendoutput waits for client ACK inside the
-  BMC loop, which stalls guest output until the operator types (Enter pump).
-  Send once, return, retry from poll_tx(); continue the queue on ACK.
+- non-blocking SOL TX without stop-and-wait: pyghmi's _sendoutput blocks the
+  BMC loop on client ACK, and some ipmitool builds only emit ACKs when the
+  operator types (Enter pump). Lab mode sends and continues the queue.
 """
 
 import contextlib
@@ -49,9 +49,10 @@ RECONNECT_INTERVAL = 1
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 0.02
 SOL_INACTIVE = 0x10
-# Non-blocking ACK wait: retry interval and budget (was a blocking ~15s loop).
-ACK_RETRY_INTERVAL = 0.5
-ACK_MAX_RETRIES = 10
+# Drain several SOL packets per BMC tick once stop-and-wait is disabled.
+TX_PACKETS_PER_POLL = 8
+# Marker checked by setup-bmc.yml verify task.
+LAB_SOL_NO_ACK_WAIT = True
 
 
 class ServerConsole(console.ServerConsole):
@@ -84,8 +85,6 @@ class ServerConsole(console.ServerConsole):
         self.maxoutcount = CHARACTERS_PER_PACKET
         self.lastpayload = None
         self.lasttextsize = 0
-        self._ack_deadline = 0.0
-        self._ack_retries_left = 0
 
     def _got_sol_payload(self, payload):
         if (not isinstance(payload, dict)
@@ -94,10 +93,8 @@ class ServerConsole(console.ServerConsole):
         self.last_activity = time.monotonic()
         was_awaiting = self.awaitingack
         super(ServerConsole, self)._got_sol_payload(payload)
-        # Upstream ServerConsole clears awaitingack on a matching ACK but does
-        # not continue the TX queue (client Console relied on blocking
-        # _sendoutput returning to the caller). Flush pending immediately so
-        # guest output keeps streaming without an Enter/CR pump.
+        # Upstream clears awaitingack on ACK but does not continue the TX
+        # queue; flush if anything is still pending.
         if (was_awaiting and not self.awaitingack and not self.broken
                 and self.activated and self.pendingoutput):
             self._sendpendingoutput()
@@ -111,10 +108,11 @@ class ServerConsole(console.ServerConsole):
                          else {'error': error})
 
     def _sendoutput(self, output, sendbreak=False):
-        """Send one SOL data packet without blocking for the client ACK.
+        """Send one SOL data packet; do not stop-and-wait for client ACK.
 
-        Upstream pyghmi waits in a nested wait_for_rsp loop here; that freezes
-        libvirt polling until the client ACKs (often only after a keystroke).
+        Upstream pyghmi blocks here in wait_for_rsp until the client ACKs.
+        Lab ipmitool sessions often only emit ACKs when the operator types,
+        which freezes guest output until Enter is held. Send and move on.
         """
         self.myseq += 1
         self.myseq &= 0xf
@@ -128,39 +126,24 @@ class ServerConsole(console.ServerConsole):
                        + output.encode('utf8'))
         self.lasttextsize = len(output)
         needskeepalive = self.lasttextsize == 0
-        self.awaitingack = True
         self.lastpayload = payload
-        self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
-        self._ack_retries_left = ACK_MAX_RETRIES
+        # Intentionally leave awaitingack False (LAB_SOL_NO_ACK_WAIT) so
+        # _sendpendingoutput / poll_tx can keep draining without an ACK.
+        self.awaitingack = False
         self.send_payload(payload, retry=False, needskeepalive=needskeepalive)
 
     def poll_tx(self):
-        """Pump IPMI ACKs, retry unacked TX, or flush pending (BMC tick)."""
+        """Pump IPMI RX and drain pending SOL TX (BMC event-loop tick)."""
         if self.broken or not self.activated or not self.connected:
             return
-        # listen() already waits, but drain any ACK that arrived since then
-        # before deciding whether to retry or continue the queue.
         try:
             self.wait_for_rsp(0)
         except Exception:
             pass
         with self.outputlock:
-            if self.awaitingack:
-                if time.monotonic() < self._ack_deadline:
-                    return
-                if self._ack_retries_left <= 0:
-                    self._print_error('SOL ACK timeout')
-                    return
-                self._ack_retries_left -= 1
-                self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
-                try:
-                    self.send_payload(
-                        self.lastpayload, retry=False,
-                        needskeepalive=(self.lasttextsize == 0))
-                except (ipmi_exception.IpmiException, OSError) as exc:
-                    self._print_error(str(exc))
-                return
-            if self.pendingoutput:
+            for _ in range(TX_PACKETS_PER_POLL):
+                if not self.pendingoutput:
+                    break
                 self._sendpendingoutput()
 
     def send_payload(self, payload, payload_type=1, retry=True,
@@ -182,7 +165,6 @@ class ServerConsole(console.ServerConsole):
         self.awaitingack = False
         self.pendingoutput = []
         self.lastpayload = None
-        self._ack_retries_left = 0
         if session is None or session.sol_handler != self._got_sol_payload:
             return
         session.sol_handler = None
@@ -305,8 +287,22 @@ class LibvirtConsole(object):
                 sent = self._stream.send(self._pending)
                 if sent > 0:
                     self._pending = self._pending[sent:]
+            # Event callbacks fill _outbuf; also drain here after
+            # virEventRunDefaultImpl in case readable data is still pending.
+            while len(self._outbuf) < MAX_OUTBUF:
+                data = self._stream.recv(CHARACTERS_PER_PACKET)
+                if data == -2:
+                    break
+                if not data:
+                    self.close()
+                    self._retry_at = time.monotonic() + RECONNECT_INTERVAL
+                    break
+                room = MAX_OUTBUF - len(self._outbuf)
+                self._outbuf += data[:room]
+                if room < len(data):
+                    break
         except libvirt.libvirtError as exc:
-            LOG.debug('SOL console send failed for %(domain)s: %(error)s',
+            LOG.debug('SOL console send/recv failed for %(domain)s: %(error)s',
                       {'domain': self.domain_name, 'error': exc})
             self.close()
             self._retry_at = time.monotonic() + RECONNECT_INTERVAL

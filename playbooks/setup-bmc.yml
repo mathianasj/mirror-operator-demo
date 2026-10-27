@@ -315,15 +315,24 @@
             from pathlib import Path
             import virtualbmc.sol as solmod
             import virtualbmc.vbmc as vbmcmod
-            assert hasattr(solmod.ServerConsole, "poll_tx"), "sol.ServerConsole missing poll_tx"
-            src = Path(solmod.__file__).read_text()
-            assert "was_awaiting" in src, "sol.py missing ACK queue flush"
+            assert getattr(solmod, "LAB_SOL_NO_ACK_WAIT", False), (
+                "sol.py missing LAB_SOL_NO_ACK_WAIT (stale overlay?)"
+            )
+            assert hasattr(solmod.ServerConsole, "poll_tx"), (
+                "sol.ServerConsole missing poll_tx"
+            )
             assert "poll_tx" in Path(vbmcmod.__file__).read_text(), (
                 "vbmc._poll_sol missing poll_tx hook"
             )
             print("ok", solmod.__file__, vbmcmod.__file__)
       register: vbmc_sol_verify
       changed_when: false
+
+    - name: Restart vbmcd to load lab SOL overlay
+      ansible.builtin.service:
+        name: vbmcd
+        state: restarted
+      failed_when: false
 
     - name: Create BMC directories
       ansible.builtin.file:
