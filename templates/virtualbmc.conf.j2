@@ -8,4 +8,5 @@ debug = false
 logfile = {{ vbmc_log_dir }}/vbmcd.log
 
 [ipmi]
-session_timeout = 60
+# Quiet hw-gather (LLDP wait ~45s) must not drop the SOL session.
+session_timeout = 900
