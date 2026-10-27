@@ -14,15 +14,14 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Single-client SOL transport and a nonblocking libvirt console bridge.
+"""Single-client SOL transport and a threaded libvirt console bridge.
 
 Lab patch on top of upstream VirtualBMC master:
 - VIR_DOMAIN_CONSOLE_FORCE so Cockpit/virsh do not block SOL
-- stream event callbacks + output buffer (plain NONBLOCK recv often
-  returns -2 forever on RHEL libvirt unless events are registered)
-- non-blocking SOL TX without stop-and-wait: pyghmi's _sendoutput blocks the
-  BMC loop on client ACK, and some ipmitool builds only emit ACKs when the
-  operator types (Enter pump). Lab mode sends and continues the queue.
+- dedicated I/O thread with a blocking libvirt stream so guest→host serial
+  is not gated on client TX / virEvent delivery (the Enter/CR pump)
+- non-blocking SOL TX: send one packet, return to the BMC loop, continue the
+  queue on ACK (or a short soft timeout) via poll_tx()
 """
 
 import contextlib
@@ -49,10 +48,12 @@ RECONNECT_INTERVAL = 1
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 0.02
 SOL_INACTIVE = 0x10
-# Drain several SOL packets per BMC tick once stop-and-wait is disabled.
-TX_PACKETS_PER_POLL = 8
+# Soft ACK wait: retry once, then continue so a silent client cannot freeze SOL.
+ACK_RETRY_INTERVAL = 0.15
+ACK_MAX_RETRIES = 2
+TX_PACKETS_PER_POLL = 4
 # Marker checked by setup-bmc.yml verify task.
-LAB_SOL_NO_ACK_WAIT = True
+LAB_SOL_READER_THREAD = True
 
 
 class ServerConsole(console.ServerConsole):
@@ -85,6 +86,8 @@ class ServerConsole(console.ServerConsole):
         self.maxoutcount = CHARACTERS_PER_PACKET
         self.lastpayload = None
         self.lasttextsize = 0
+        self._ack_deadline = 0.0
+        self._ack_retries_left = 0
 
     def _got_sol_payload(self, payload):
         if (not isinstance(payload, dict)
@@ -93,8 +96,7 @@ class ServerConsole(console.ServerConsole):
         self.last_activity = time.monotonic()
         was_awaiting = self.awaitingack
         super(ServerConsole, self)._got_sol_payload(payload)
-        # Upstream clears awaitingack on ACK but does not continue the TX
-        # queue; flush if anything is still pending.
+        # Upstream clears awaitingack on ACK but does not continue the TX queue.
         if (was_awaiting and not self.awaitingack and not self.broken
                 and self.activated and self.pendingoutput):
             self._sendpendingoutput()
@@ -108,12 +110,7 @@ class ServerConsole(console.ServerConsole):
                          else {'error': error})
 
     def _sendoutput(self, output, sendbreak=False):
-        """Send one SOL data packet; do not stop-and-wait for client ACK.
-
-        Upstream pyghmi blocks here in wait_for_rsp until the client ACKs.
-        Lab ipmitool sessions often only emit ACKs when the operator types,
-        which freezes guest output until Enter is held. Send and move on.
-        """
+        """Send one SOL data packet without blocking the BMC event loop."""
         self.myseq += 1
         self.myseq &= 0xf
         if self.myseq == 0:
@@ -126,14 +123,14 @@ class ServerConsole(console.ServerConsole):
                        + output.encode('utf8'))
         self.lasttextsize = len(output)
         needskeepalive = self.lasttextsize == 0
+        self.awaitingack = True
         self.lastpayload = payload
-        # Intentionally leave awaitingack False (LAB_SOL_NO_ACK_WAIT) so
-        # _sendpendingoutput / poll_tx can keep draining without an ACK.
-        self.awaitingack = False
+        self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
+        self._ack_retries_left = ACK_MAX_RETRIES
         self.send_payload(payload, retry=False, needskeepalive=needskeepalive)
 
     def poll_tx(self):
-        """Pump IPMI RX and drain pending SOL TX (BMC event-loop tick)."""
+        """Pump IPMI RX, retry/skip ACK wait, and drain pending TX."""
         if self.broken or not self.activated or not self.connected:
             return
         try:
@@ -141,8 +138,24 @@ class ServerConsole(console.ServerConsole):
         except Exception:
             pass
         with self.outputlock:
+            if self.awaitingack:
+                if time.monotonic() < self._ack_deadline:
+                    return
+                if self._ack_retries_left > 0:
+                    self._ack_retries_left -= 1
+                    self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
+                    try:
+                        self.send_payload(
+                            self.lastpayload, retry=False,
+                            needskeepalive=(self.lasttextsize == 0))
+                    except (ipmi_exception.IpmiException, OSError) as exc:
+                        self._print_error(str(exc))
+                    return
+                # Soft timeout: continue streaming rather than freeze on Enter.
+                self.awaitingack = False
+                self.lastpayload = None
             for _ in range(TX_PACKETS_PER_POLL):
-                if not self.pendingoutput:
+                if self.awaitingack or not self.pendingoutput:
                     break
                 self._sendpendingoutput()
 
@@ -165,6 +178,7 @@ class ServerConsole(console.ServerConsole):
         self.awaitingack = False
         self.pendingoutput = []
         self.lastpayload = None
+        self._ack_retries_left = 0
         if session is None or session.sol_handler != self._got_sol_payload:
             return
         session.sol_handler = None
@@ -177,7 +191,13 @@ class ServerConsole(console.ServerConsole):
 
 
 class LibvirtConsole(object):
-    """Nonblocking console stream, serviced in the BMC's event loop."""
+    """Console bridge with a dedicated blocking reader thread.
+
+    Upstream VirtualBMC uses NONBLOCK + virEvent callbacks in the BMC loop.
+    On this lab stack, guest output effectively drips only when the SOL client
+    transmits (Enter/CR pump). Owning the stream in a thread with a blocking
+    ``recv`` decouples serial RX from IPMI client TX.
+    """
 
     def __init__(self, domain_name, conn_args):
         self.domain_name = domain_name
@@ -188,8 +208,10 @@ class LibvirtConsole(object):
         self._stream = None
         self._pending = b''
         self._outbuf = bytearray()
+        self._lock = threading.Lock()
         self._retry_at = 0
-        self._callback_registered = False
+        self._stop = threading.Event()
+        self._thread = None
 
     def open(self):
         """Connect to libvirt and attach the console if the guest is active."""
@@ -210,129 +232,144 @@ class LibvirtConsole(object):
     def _attach(self):
         if not self._domain.isActive():
             return
+        self._stop_reader()
+        # NONBLOCK in a dedicated thread (tight poll). Main-thread NONBLOCK
+        # recv without that poll returns -2 forever on RHEL; virEvent delivery
+        # here effectively needed client TX. A side thread avoids both.
         self._stream = self._conn.newStream(libvirt.VIR_STREAM_NONBLOCK)
-        # FORCE: steal from Cockpit/virsh so lab SOL works with a UI open.
         self._domain.openConsole(None, self._stream,
                                  libvirt.VIR_DOMAIN_CONSOLE_FORCE)
-        events = (
-            libvirt.VIR_STREAM_EVENT_READABLE
-            | libvirt.VIR_STREAM_EVENT_ERROR
-            | libvirt.VIR_STREAM_EVENT_HANGUP
-        )
-        self._stream.eventAddCallback(events, self._on_stream_event, None)
-        self._callback_registered = True
-        LOG.debug('SOL console stream attached for %s', self.domain_name)
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._io_loop,
+            name='vbmc-sol-%s' % self.domain_name,
+            daemon=True)
+        self._thread.start()
+        LOG.debug('SOL console reader thread attached for %s', self.domain_name)
 
-    def _on_stream_event(self, stream, events, _opaque):
-        try:
-            if events & libvirt.VIR_STREAM_EVENT_READABLE:
-                while True:
-                    data = stream.recv(CHARACTERS_PER_PACKET)
-                    if data == -2:
-                        break
-                    if not data:
-                        # EOF
-                        self.close()
-                        self._retry_at = time.monotonic() + RECONNECT_INTERVAL
-                        return
-                    room = MAX_OUTBUF - len(self._outbuf)
-                    if room <= 0:
-                        LOG.warning(
-                            'SOL output buffer full for %s; dropping',
-                            self.domain_name)
-                        break
-                    self._outbuf += data[:room]
-            if events & (
-                    libvirt.VIR_STREAM_EVENT_ERROR
-                    | libvirt.VIR_STREAM_EVENT_HANGUP):
-                self.close()
-                self._retry_at = time.monotonic() + RECONNECT_INTERVAL
-        except libvirt.libvirtError as exc:
-            LOG.debug('SOL stream event error for %(domain)s: %(error)s',
-                      {'domain': self.domain_name, 'error': exc})
-            self.close()
-            self._retry_at = time.monotonic() + RECONNECT_INTERVAL
-
-    def write(self, data):
-        """Queue input, discarding keystrokes while the stream is absent."""
-        if self._stream is None:
-            return
-        if len(self._pending) + len(data) > MAX_PENDING_INPUT:
-            raise BufferError('SOL console input buffer is full')
-        self._pending += data
-
-    def poll(self):
-        """Flush queued input and return at most one SOL packet of output."""
-        if self._stream is None:
-            if time.monotonic() < self._retry_at:
-                return b''
+    def _stop_reader(self):
+        self._stop.set()
+        stream = self._stream
+        if stream is not None:
             try:
-                if self._conn is None:
-                    self.open()
-                else:
-                    self._attach()
-            except (libvirt.libvirtError, exception.VirtualBMCError) as exc:
-                LOG.debug('SOL console reconnect for %(domain)s: %(error)s',
-                          {'domain': self.domain_name, 'error': exc})
-                self.close()
-                return b''
-            finally:
-                self._retry_at = time.monotonic() + RECONNECT_INTERVAL
-
-        if self._stream is None:
-            return b''
-
-        try:
-            if self._pending:
-                sent = self._stream.send(self._pending)
-                if sent > 0:
-                    self._pending = self._pending[sent:]
-            # Event callbacks fill _outbuf; also drain here after
-            # virEventRunDefaultImpl in case readable data is still pending.
-            while len(self._outbuf) < MAX_OUTBUF:
-                data = self._stream.recv(CHARACTERS_PER_PACKET)
-                if data == -2:
-                    break
-                if not data:
-                    self.close()
-                    self._retry_at = time.monotonic() + RECONNECT_INTERVAL
-                    break
-                room = MAX_OUTBUF - len(self._outbuf)
-                self._outbuf += data[:room]
-                if room < len(data):
-                    break
-        except libvirt.libvirtError as exc:
-            LOG.debug('SOL console send/recv failed for %(domain)s: %(error)s',
-                      {'domain': self.domain_name, 'error': exc})
-            self.close()
-            self._retry_at = time.monotonic() + RECONNECT_INTERVAL
-            return b''
-
-        if not self._outbuf:
-            return b''
-        chunk = bytes(self._outbuf[:CHARACTERS_PER_PACKET])
-        del self._outbuf[:len(chunk)]
-        return chunk
-
-    def close(self):
-        """Release the stream and connection, discarding pending input."""
-        stream, self._stream = self._stream, None
-        self._conn = self._domain = None
-        self._pending = b''
-        self._outbuf = bytearray()
-        try:
-            if stream is not None and self._callback_registered:
-                try:
-                    stream.eventRemoveCallback()
-                except libvirt.libvirtError:
-                    pass
-            self._callback_registered = False
-            if stream is not None:
                 stream.abort()
-        except libvirt.libvirtError:
-            pass
-        finally:
-            try:
-                self._resources.close()
             except libvirt.libvirtError:
                 pass
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    def _io_loop(self):
+        stream = self._stream
+        if stream is None:
+            return
+        try:
+            while not self._stop.is_set():
+                # Flush host→guest keystrokes without blocking the BMC loop.
+                with self._lock:
+                    pending = self._pending
+                    self._pending = b''
+                if pending:
+                    try:
+                        while pending and not self._stop.is_set():
+                            sent = stream.send(pending)
+                            if sent == -2:
+                                break
+                            if sent <= 0:
+                                break
+                            pending = pending[sent:]
+                        if pending:
+                            with self._lock:
+                                self._pending = pending + self._pending
+                    except libvirt.libvirtError as exc:
+                        LOG.debug(
+                            'SOL console send failed for %(domain)s: %(error)s',
+                            {'domain': self.domain_name, 'error': exc})
+                        break
+
+                got = False
+                try:
+                    while not self._stop.is_set():
+                        data = stream.recv(CHARACTERS_PER_PACKET)
+                        if data == -2:
+                            break
+                        if not data:
+                            return
+                        got = True
+                        with self._lock:
+                            room = MAX_OUTBUF - len(self._outbuf)
+                            if room <= 0:
+                                LOG.warning(
+                                    'SOL output buffer full for %s; dropping',
+                                    self.domain_name)
+                                break
+                            self._outbuf += data[:room]
+                            if room < len(data):
+                                break
+                except libvirt.libvirtError as exc:
+                    if self._stop.is_set():
+                        break
+                    LOG.debug(
+                        'SOL console recv failed for %(domain)s: %(error)s',
+                        {'domain': self.domain_name, 'error': exc})
+                    break
+                if not got:
+                    self._stop.wait(0.01)
+        finally:
+            self._retry_at = time.monotonic() + RECONNECT_INTERVAL
+            with self._lock:
+                if self._stream is stream:
+                    self._stream = None
+
+    def write(self, data):
+        """Queue input for the I/O thread (keystrokes from the SOL client)."""
+        with self._lock:
+            if self._stream is None and self._thread is None:
+                return
+            if len(self._pending) + len(data) > MAX_PENDING_INPUT:
+                raise BufferError('SOL console input buffer is full')
+            self._pending += data
+
+    def poll(self):
+        """Return at most one SOL packet of buffered guest output."""
+        with self._lock:
+            if self._outbuf:
+                chunk = bytes(self._outbuf[:CHARACTERS_PER_PACKET])
+                del self._outbuf[:len(chunk)]
+                return chunk
+            alive = (
+                self._stream is not None
+                or (self._thread is not None and self._thread.is_alive())
+            )
+
+        if alive:
+            return b''
+
+        if time.monotonic() < self._retry_at:
+            return b''
+        try:
+            if self._conn is None:
+                self.open()
+            else:
+                self._attach()
+        except (libvirt.libvirtError, exception.VirtualBMCError) as exc:
+            LOG.debug('SOL console reconnect for %(domain)s: %(error)s',
+                      {'domain': self.domain_name, 'error': exc})
+            self.close()
+        finally:
+            self._retry_at = time.monotonic() + RECONNECT_INTERVAL
+        return b''
+
+    def close(self):
+        """Stop the reader thread and release libvirt resources."""
+        self._stop_reader()
+        self._conn = self._domain = None
+        with self._lock:
+            self._pending = b''
+            self._outbuf = bytearray()
+            self._stream = None
+        try:
+            self._resources.close()
+        except libvirt.libvirtError:
+            pass
