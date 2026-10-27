@@ -353,8 +353,8 @@
             assert getattr(solmod, "LAB_SOL_BLOCKING_CONSOLE", False), (
                 "sol.py missing LAB_SOL_BLOCKING_CONSOLE (stale overlay?)"
             )
-            assert getattr(solmod, "LAB_SOL_NO_ACK_WAIT", False), (
-                "sol.py missing LAB_SOL_NO_ACK_WAIT (stale overlay?)"
+            assert getattr(solmod, "LAB_SOL_ACK_WINDOW", False), (
+                "sol.py missing LAB_SOL_ACK_WINDOW (stale overlay?)"
             )
             assert hasattr(solmod.ServerConsole, "poll_tx"), (
                 "sol.ServerConsole missing poll_tx"

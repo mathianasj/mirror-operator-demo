@@ -20,7 +20,7 @@ Lab patch on top of upstream VirtualBMC master:
 - VIR_DOMAIN_CONSOLE_FORCE so Cockpit/virsh do not block SOL
 - dedicated libvirt connection + blocking stream reader thread (same-conn
   NONBLOCK/virEvent only drips guest output when the SOL client transmits)
-- non-blocking SOL TX with soft ACK timeout via poll_tx()
+- non-blocking SOL TX with a one-packet ACK window (soft timeout) via poll_tx()
 """
 
 import contextlib
@@ -47,11 +47,15 @@ RECONNECT_INTERVAL = 1
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 0.02
 SOL_INACTIVE = 0x10
-TX_PACKETS_PER_POLL = 16
+# One outstanding SOL data packet (protocol stop-and-wait). Soft-ACK so a
+# silent client cannot freeze the BMC loop; blasting without ACK kills ipmitool.
+ACK_RETRY_INTERVAL = 0.1
+ACK_MAX_RETRIES = 3
+TX_PACKETS_PER_POLL = 4
 # Marker checked by setup-bmc.yml verify task.
 LAB_SOL_READER_THREAD = True
 LAB_SOL_BLOCKING_CONSOLE = True
-LAB_SOL_NO_ACK_WAIT = True
+LAB_SOL_ACK_WINDOW = True
 
 
 class ServerConsole(console.ServerConsole):
@@ -84,6 +88,8 @@ class ServerConsole(console.ServerConsole):
         self.maxoutcount = CHARACTERS_PER_PACKET
         self.lastpayload = None
         self.lasttextsize = 0
+        self._ack_deadline = 0.0
+        self._ack_retries_left = 0
 
     def _got_sol_payload(self, payload):
         if (not isinstance(payload, dict)
@@ -103,12 +109,7 @@ class ServerConsole(console.ServerConsole):
                          else {'error': error})
 
     def _sendoutput(self, output, sendbreak=False):
-        """Send one SOL packet without stop-and-wait (lab streaming).
-
-        Combined with the blocking console reader thread, this is what makes
-        guest output flow without an Enter/CR pump. Real BMCs/ipmitool still
-        exchange ACKs; we simply do not stall the TX queue on them.
-        """
+        """Send one SOL packet; wait for ACK without blocking the BMC loop."""
         self.myseq += 1
         self.myseq &= 0xf
         if self.myseq == 0:
@@ -122,11 +123,20 @@ class ServerConsole(console.ServerConsole):
         self.lasttextsize = len(output)
         needskeepalive = self.lasttextsize == 0
         self.lastpayload = payload
-        self.awaitingack = False  # LAB_SOL_NO_ACK_WAIT
+        self.awaitingack = True
+        self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
+        self._ack_retries_left = ACK_MAX_RETRIES
         self.send_payload(payload, retry=False, needskeepalive=needskeepalive)
+        # Brief pump so a prompt client ACK is seen without an Enter keystroke.
+        try:
+            expiry = time.monotonic() + 0.03
+            while self.awaitingack and time.monotonic() < expiry:
+                self.wait_for_rsp(0.01)
+        except Exception:
+            pass
 
     def poll_tx(self):
-        """Pump IPMI RX and drain pending SOL TX."""
+        """Pump IPMI RX, honor ACK window, soft-continue, drain pending TX."""
         if self.broken or not self.activated or not self.connected:
             return
         try:
@@ -134,8 +144,32 @@ class ServerConsole(console.ServerConsole):
         except Exception:
             pass
         with self.outputlock:
+            if self.awaitingack:
+                try:
+                    self.wait_for_rsp(0.02)
+                except Exception:
+                    pass
+                if not self.awaitingack:
+                    pass
+                elif time.monotonic() < self._ack_deadline:
+                    return
+                elif self._ack_retries_left > 0:
+                    self._ack_retries_left -= 1
+                    self._ack_deadline = time.monotonic() + ACK_RETRY_INTERVAL
+                    try:
+                        self.send_payload(
+                            self.lastpayload, retry=False,
+                            needskeepalive=(self.lasttextsize == 0))
+                    except (ipmi_exception.IpmiException, OSError) as exc:
+                        self._print_error(str(exc))
+                    return
+                else:
+                    # Soft-ACK: continue rather than freeze or kill the client
+                    # by flooding unacked sequence numbers.
+                    self.awaitingack = False
+                    self.lastpayload = None
             for _ in range(TX_PACKETS_PER_POLL):
-                if not self.pendingoutput:
+                if self.awaitingack or not self.pendingoutput:
                     break
                 self._sendpendingoutput()
 
