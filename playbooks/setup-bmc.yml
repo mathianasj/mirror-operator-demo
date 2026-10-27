@@ -274,30 +274,62 @@
         mode: "0644"
       notify: Restart vbmcd
 
-    - name: Patch VirtualBMC _poll_sol to drive non-blocking SOL TX
+    - name: Patch VirtualBMC _poll_sol for lab SOL streaming
       ansible.builtin.shell: |
         set -e
         python3 <<PY
+        import re
         from pathlib import Path
         path = Path({{ ((vbmc_pkg_dir.stdout | trim) ~ '/vbmc.py') | to_json }})
         text = path.read_text()
-        if "hasattr(console, 'poll_tx')" in text:
+        new_poll = '''
+    def _poll_sol(self):
+        self._expire_sol()
+        console = self.sol
+        if console is None:
+            return
+        if hasattr(console, 'poll_tx'):
+            console.poll_tx()
+        bridge = self._console
+        if bridge is None:
+            return
+        # Drain several packets per tick so a full outbuf can stream without
+        # waiting on the libvirt event timer between SOL payloads.
+        for _ in range(16):
+            data = bridge.poll()
+            if not data:
+                break
+            try:
+                console.send_data(data)
+            except (ipmi_exception.IpmiException, OSError) as exc:
+                LOG.warning('SOL output failed for %(domain)s: %(error)s',
+                            {'domain': self.domain_name, 'error': exc})
+                if self.sol is console:
+                    self._close_sol()
+                break
+'''
+        pattern = re.compile(
+            r"\n    def _poll_sol\(self\):.*?(?=\n    def )",
+            re.S,
+        )
+        if "for _ in range(16):" in text and "bridge.poll()" in text:
             print("already patched")
             raise SystemExit(0)
-        needle = (
-            "    def _poll_sol(self):\n"
-            "        self._expire_sol()\n"
-            "        console = self.sol\n"
-            "        if console is None:\n"
-            "            return\n"
+        if not pattern.search(text):
+            raise SystemExit("Could not find _poll_sol in %s" % path)
+        text2, n = pattern.subn("\n" + new_poll.lstrip("\n"), text, count=1)
+        if n != 1:
+            raise SystemExit("Failed to replace _poll_sol in %s" % path)
+        # When SOL is active, prefer a short sleep over virEventRunDefaultImpl
+        # (no stream callbacks with the lab reader thread).
+        text2 = text2.replace(
+            "                    ipmi_session.Session.wait_for_rsp(0)\n"
+            "                    libvirt.virEventRunDefaultImpl()\n",
+            "                    ipmi_session.Session.wait_for_rsp(0)\n"
+            "                    time.sleep(sol.POLL_INTERVAL)\n",
+            1,
         )
-        insert = needle + (
-            "        if hasattr(console, 'poll_tx'):\n"
-            "            console.poll_tx()\n"
-        )
-        if needle not in text:
-            raise SystemExit("Could not find _poll_sol pattern in %s" % path)
-        path.write_text(text.replace(needle, insert, 1))
+        path.write_text(text2)
         print("patched")
         PY
       args:
@@ -317,6 +349,12 @@
             import virtualbmc.vbmc as vbmcmod
             assert getattr(solmod, "LAB_SOL_READER_THREAD", False), (
                 "sol.py missing LAB_SOL_READER_THREAD (stale overlay?)"
+            )
+            assert getattr(solmod, "LAB_SOL_BLOCKING_CONSOLE", False), (
+                "sol.py missing LAB_SOL_BLOCKING_CONSOLE (stale overlay?)"
+            )
+            assert getattr(solmod, "LAB_SOL_NO_ACK_WAIT", False), (
+                "sol.py missing LAB_SOL_NO_ACK_WAIT (stale overlay?)"
             )
             assert hasattr(solmod.ServerConsole, "poll_tx"), (
                 "sol.ServerConsole missing poll_tx"
