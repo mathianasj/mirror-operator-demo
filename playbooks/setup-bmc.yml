@@ -141,6 +141,50 @@
           - import libvirt; print(libvirt.getVersion())
       changed_when: false
 
+    # Lab SOL patch: FORCE console steal + stream event callbacks (upstream SAFE +
+    # plain NONBLOCK recv yields empty SOL on RHEL libvirt while virsh console works).
+    # Also non-blocking SOL TX so guest output streams without an Enter/CR pump.
+    - name: Install lab-patched VirtualBMC SOL module
+      ansible.builtin.copy:
+        src: ../files/virtualbmc-sol.py
+        dest: "{{ item }}"
+        mode: "0644"
+      loop: "{{ query('fileglob', vbmc_install_dir ~ '/lib/python*/site-packages/virtualbmc/sol.py') }}"
+      notify: Restart vbmcd
+
+    - name: Patch VirtualBMC _poll_sol to drive non-blocking SOL TX
+      ansible.builtin.shell: |
+        set -e
+        python3 <<PY
+        from pathlib import Path
+        path = Path({{ item | to_json }})
+        text = path.read_text()
+        if "hasattr(console, 'poll_tx')" in text:
+            print("already patched")
+            raise SystemExit(0)
+        needle = (
+            "    def _poll_sol(self):\n"
+            "        self._expire_sol()\n"
+            "        console = self.sol\n"
+            "        if console is None:\n"
+            "            return\n"
+        )
+        insert = needle + (
+            "        if hasattr(console, 'poll_tx'):\n"
+            "            console.poll_tx()\n"
+        )
+        if needle not in text:
+            raise SystemExit("Could not find _poll_sol pattern in %s" % path)
+        path.write_text(text.replace(needle, insert, 1))
+        print("patched")
+        PY
+      args:
+        executable: /bin/bash
+      loop: "{{ query('fileglob', vbmc_install_dir ~ '/lib/python*/site-packages/virtualbmc/vbmc.py') }}"
+      register: vbmc_poll_patch
+      changed_when: "'patched' in vbmc_poll_patch.stdout"
+      notify: Restart vbmcd
+
     - name: Check VirtualBMC console scripts after install
       ansible.builtin.stat:
         path: "{{ item }}"
@@ -208,6 +252,49 @@
           - -c
           - import libvirt; print(libvirt.getVersion())
       changed_when: false
+      when: not (vbmc_scripts_ok | bool)
+
+    - name: Re-install lab-patched VirtualBMC SOL module after venv recreate
+      ansible.builtin.copy:
+        src: ../files/virtualbmc-sol.py
+        dest: "{{ item }}"
+        mode: "0644"
+      loop: "{{ query('fileglob', vbmc_install_dir ~ '/lib/python*/site-packages/virtualbmc/sol.py') }}"
+      notify: Restart vbmcd
+      when: not (vbmc_scripts_ok | bool)
+
+    - name: Re-patch VirtualBMC _poll_sol after venv recreate
+      ansible.builtin.shell: |
+        set -e
+        python3 <<PY
+        from pathlib import Path
+        path = Path({{ item | to_json }})
+        text = path.read_text()
+        if "hasattr(console, 'poll_tx')" in text:
+            print("already patched")
+            raise SystemExit(0)
+        needle = (
+            "    def _poll_sol(self):\n"
+            "        self._expire_sol()\n"
+            "        console = self.sol\n"
+            "        if console is None:\n"
+            "            return\n"
+        )
+        insert = needle + (
+            "        if hasattr(console, 'poll_tx'):\n"
+            "            console.poll_tx()\n"
+        )
+        if needle not in text:
+            raise SystemExit("Could not find _poll_sol pattern in %s" % path)
+        path.write_text(text.replace(needle, insert, 1))
+        print("patched")
+        PY
+      args:
+        executable: /bin/bash
+      loop: "{{ query('fileglob', vbmc_install_dir ~ '/lib/python*/site-packages/virtualbmc/vbmc.py') }}"
+      register: vbmc_poll_patch_retry
+      changed_when: "'patched' in vbmc_poll_patch_retry.stdout"
+      notify: Restart vbmcd
       when: not (vbmc_scripts_ok | bool)
 
     - name: Re-check VirtualBMC console scripts after recreate
