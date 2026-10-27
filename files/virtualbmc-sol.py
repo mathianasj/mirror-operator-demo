@@ -47,16 +47,10 @@ RECONNECT_INTERVAL = 1
 IDLE_TIMEOUT = 900
 POLL_INTERVAL = 0.005
 SOL_INACTIVE = 0x10
-# Upstream pyghmi blocks in _sendoutput until ACK. Do the same with shorter
-# slices for local lanplus. Never hold outputlock across wait_for_rsp — that
-# deadlocks (_got_sol_payload → _sendpendingoutput needs the same lock).
-ACK_WAIT_SLICE = 0.05
-ACK_RETRY_WAIT = 0.3
-ACK_MAX_RETRIES = 15
-TX_PACKETS_PER_POLL = 4
 # Marker checked by setup-bmc.yml verify task.
 LAB_SOL_READER_THREAD = True
 LAB_SOL_BLOCKING_CONSOLE = True
+# Upstream pyghmi _sendoutput stop-and-wait ACK (not fire-and-forget).
 LAB_SOL_ACK_WINDOW = True
 
 
@@ -104,59 +98,18 @@ class ServerConsole(console.ServerConsole):
         self.out_handler(error if isinstance(error, dict)
                          else {'error': error})
 
-    def _sendoutput(self, output, sendbreak=False):
-        """Send one SOL packet and wait for ACK (pyghmi-style, shorter waits)."""
-        self.myseq += 1
-        self.myseq &= 0xf
-        if self.myseq == 0:
-            self.myseq = 1
-        breakbyte = 0b10000 if sendbreak else 0
-        try:
-            payload = bytearray((self.myseq, 0, 0, breakbyte)) + output
-        except TypeError:
-            payload = (bytearray((self.myseq, 0, 0, breakbyte))
-                       + output.encode('utf8'))
-        self.lasttextsize = len(output)
-        needskeepalive = self.lasttextsize == 0
-        self.lastpayload = payload
-        self.awaitingack = True
-        self.send_payload(payload, retry=False, needskeepalive=needskeepalive)
-        retries = ACK_MAX_RETRIES
-        while retries and self.awaitingack and self.activated and not self.broken:
-            expiry = time.monotonic() + ACK_RETRY_WAIT
-            while (self.awaitingack and self.activated and not self.broken
-                   and time.monotonic() < expiry):
-                try:
-                    self.wait_for_rsp(ACK_WAIT_SLICE)
-                except Exception:
-                    break
-            if self.awaitingack and self.activated and not self.broken:
-                try:
-                    self.send_payload(
-                        payload, retry=False, needskeepalive=needskeepalive)
-                except (ipmi_exception.IpmiException, OSError) as exc:
-                    self._print_error(str(exc))
-                    return
-            retries -= 1
-        if self.awaitingack:
-            self._print_error('SOL ACK timeout; closing session')
-
     def poll_tx(self):
-        """Pump IPMI RX and drain pending SOL TX. Do not hold outputlock here."""
+        """Pump IPMI RX so ACKs are processed between libvirt drains.
+
+        TX itself uses upstream ``_sendoutput`` (blocking ACK wait). Holding
+        ``outputlock`` across ``wait_for_rsp`` deadlocks; do not do that here.
+        """
         if self.broken or not self.activated or not self.connected:
             return
         try:
             self.wait_for_rsp(0)
         except Exception:
             pass
-        if self.awaitingack:
-            return
-        for _ in range(TX_PACKETS_PER_POLL):
-            if self.awaitingack or self.broken or not self.activated:
-                break
-            if not self.pendingoutput:
-                break
-            self._sendpendingoutput()
 
     def send_payload(self, payload, payload_type=1, retry=True,
                      needskeepalive=False):
